@@ -161,6 +161,29 @@ _CUA_DRIVER_ARGS = ["mcp"]  # stdio MCP transport (fallback when the
 # application window.
 _SCREEN_CAPTURE_SENTINELS = {"screen", "desktop", "fullscreen", "full screen", "all"}
 
+# macOS answers AXChildren queries for menu items by simulating menu opens.
+# Descending into Apple-menu children can therefore enter Recent Items and
+# block the target app's main thread on stale network-volume metadata. Keep
+# the walk above menu descendants; screenshots and pixel actions remain
+# available when the shallow tree does not expose a desired control.
+_SAFE_MACOS_AX_MAX_DEPTH = 2
+
+
+def _get_window_state_args(
+    pid: Optional[int], window_id: Optional[int], session: str,
+) -> Dict[str, Any]:
+    """Build safe, consistent arguments for every window-state traversal."""
+    if pid is None or window_id is None:
+        raise RuntimeError("get_window_state requires an active pid and window_id")
+    args: Dict[str, Any] = {
+        "pid": pid,
+        "window_id": window_id,
+        "session": session,
+    }
+    if sys.platform == "darwin":
+        args["max_depth"] = _SAFE_MACOS_AX_MAX_DEPTH
+    return args
+
 # Known shell/desktop window identifiers across platforms. Matched
 # case-insensitively as a substring against both the window's app_name and
 # its title (cua-driver surfaces the Win32 class name / app name here).
@@ -2392,11 +2415,9 @@ class CuaDriverBackend(ComputerUseBackend):
             if sc_out is None:
                 gws_out = self._call_capture_tool(
                     "get_window_state",
-                    {
-                        "pid": self._active_pid,
-                        "window_id": self._active_window_id,
-                        "session": self._session_id,
-                    },
+                    _get_window_state_args(
+                        self._active_pid, self._active_window_id, self._session_id,
+                    ),
                 )
                 png_b64, image_mime_type = _image_from_tool_result(gws_out)
                 # Still grab the window title — it's cheap and useful in the
@@ -2420,11 +2441,9 @@ class CuaDriverBackend(ComputerUseBackend):
                 try:
                     cli_out = self._session._call_tool_via_cli(
                         "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
+                        _get_window_state_args(
+                            self._active_pid, self._active_window_id, self._session_id,
+                        ),
                         30.0,
                     )
                     if cli_out.get("isError") is True:
@@ -2440,11 +2459,9 @@ class CuaDriverBackend(ComputerUseBackend):
             # get_window_state: AX tree + screenshot.
             gws_out = self._call_capture_tool(
                 "get_window_state",
-                {
-                    "pid": self._active_pid,
-                    "window_id": self._active_window_id,
-                    "session": self._session_id,
-                },
+                _get_window_state_args(
+                    self._active_pid, self._active_window_id, self._session_id,
+                ),
             )
             # The persistent MCP session can return a degenerate result —
             # empty/partial data with NO exception — when the bridge is flaky
@@ -2477,11 +2494,9 @@ class CuaDriverBackend(ComputerUseBackend):
                 try:
                     cli_out = self._session._call_tool_via_cli(
                         "get_window_state",
-                        {
-                            "pid": self._active_pid,
-                            "window_id": self._active_window_id,
-                            "session": self._session_id,
-                        },
+                        _get_window_state_args(
+                            self._active_pid, self._active_window_id, self._session_id,
+                        ),
                         30.0,
                     )
                     if cli_out.get("isError") is True:

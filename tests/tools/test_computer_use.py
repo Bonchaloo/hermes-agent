@@ -1243,6 +1243,31 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_window_id == 2
 
 
+    def test_macos_capture_bounds_ax_depth_before_menu_descendants(self):
+        """A macOS AX walk must not descend into NSMenu children."""
+        from tools.computer_use import cua_backend
+
+        backend = cua_backend.CuaDriverBackend()
+        session = MagicMock()
+        captured = {}
+
+        def _call_tool(name, args):
+            assert name == "get_window_state"
+            captured.update(args)
+            return {
+                "data": "Calculator - 0 elements", "images": [],
+                "structuredContent": None, "isError": False,
+            }
+
+        session.call_tool.side_effect = _call_tool
+        backend._session = session
+
+        with patch.object(cua_backend.sys, "platform", "darwin"):
+            backend.capture(mode="ax", pid=123, window_id=456)
+
+        assert captured["max_depth"] == cua_backend._SAFE_MACOS_AX_MAX_DEPTH
+        assert captured["max_depth"] <= 2
+
     def test_capture_transport_exception_disarms_prior_target(self):
         from tools.computer_use.cua_backend import CuaDriverBackend
 
