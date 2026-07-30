@@ -15,13 +15,15 @@ import {
   type SlashChipKind,
   slashIconElement
 } from '@/components/assistant-ui/directive-text'
-import { referenceKind } from '@/components/assistant-ui/reference-kinds'
+import { referenceKind, referenceRe } from '@/components/assistant-ui/reference-kinds'
 
 import { slashCommandMatches, type SlashCommandScanOptions } from './slash-refs'
 
 export const RICH_INPUT_SLOT = 'composer-rich-input'
 
-export const REF_RE = /@(file|folder|url|image|tool|line|terminal|session):(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)/g
+/** @see referenceRe — the shared pattern every surface recognises a reference
+ *  with. Module-level `/g` regexes carry `lastIndex`, so call sites reset it. */
+export const REF_RE = referenceRe()
 
 const ESC: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }
 
@@ -478,6 +480,15 @@ export function composerPlainText(node: Node): string {
 
   if (el.dataset.refText) {
     return el.dataset.refText
+  }
+
+  // An editor holding nothing but the placeholder <br> is EMPTY. That <br> is
+  // scaffolding normalizeComposerEditorDom adds so the contenteditable keeps
+  // its height — not a line the user typed. Reading it as "\n" is how a
+  // just-cleared composer stayed non-empty: the newline got stashed as the
+  // session's draft and painted back on return.
+  if (el.dataset.slot === RICH_INPUT_SLOT && el.childNodes.length === 1 && el.firstChild?.nodeName === 'BR') {
+    return ''
   }
 
   if (el.tagName === 'BR') {
