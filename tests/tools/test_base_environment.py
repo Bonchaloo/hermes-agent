@@ -4,9 +4,19 @@ Tests _wrap_command(), _extract_cwd_from_output(), _embed_stdin_heredoc(),
 init_session() failure handling, and the CWD marker contract.
 """
 
+import os
+import signal
+import subprocess
+import time
 from unittest.mock import MagicMock
 
-from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
+import pytest
+
+from tools.environments.base import (
+    BaseEnvironment,
+    _BoundedOutputCollector,
+    _export_dump_excluding_session_vars,
+)
 
 
 class _TestableEnv(BaseEnvironment):
@@ -73,6 +83,8 @@ class TestWrapCommand:
         wrapped = env._wrap_command("echo hello", "/tmp")
 
         assert "source" not in wrapped
+        assert "mktemp " not in wrapped
+        assert "__hermes_snap_tmp" not in wrapped
 
     def test_single_quote_escaping(self):
         env = _TestableEnv()
@@ -115,25 +127,39 @@ class TestAtomicSnapshotWrite:
         assert f"> '{snap}'" not in wrapped
         assert f"> {snap}\n" not in wrapped
 
-    def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+    def test_export_dump_does_not_mask_write_failure(self):
+        """A failed export must prevent publication of a partial temp file."""
+        dump = _export_dump_excluding_session_vars('"$snapshot_tmp"')
+
+        assert "export -p" in dump
+        assert ") || true" not in dump
+
+    def test_temp_path_uses_mktemp_without_insecure_fallback(self):
+        """Writers must allocate a unique same-directory temp file portably.
+
+        Apple Bash 3.2 leaves ``$BASHPID`` unset, so using it directly collapses
+        every concurrent writer onto the same ``.tmp.`` path. ``mktemp`` gives
+        each writer a collision-free path. If allocation is unavailable, the
+        snapshot refresh must be skipped rather than inventing a predictable
+        path from shell PIDs or ``$RANDOM``.
+        """
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "$BASHPID" in wrapped
-        # The bare $$ temp form must be gone.
+        assert "mktemp " in wrapped
+        assert ".tmp.XXXXXX" in wrapped
+        assert '"$__hermes_snap_tmp"' in wrapped
+        assert '${BASHPID:-$$.$RANDOM}' not in wrapped
+        assert "__hermes_snap_tmp=$(mktemp " in wrapped
+        assert "|| exit 0" in wrapped
+        assert wrapped.index("trap '") < wrapped.index("mktemp ")
         assert ".tmp.$$" not in wrapped
 
 
-    def test_init_session_bootstrap_also_atomic_and_bashpid(self):
+    def test_init_session_bootstrap_fails_closed_without_mktemp(self):
         """The init_session bootstrap (first snapshot write) is the same shared
-        file a concurrent command could source — it must be atomic and use
-        ``$BASHPID`` too."""
+        file a concurrent command could source, so it needs the same portable
+        unique-temp allocation as normal command completion."""
         env = _TestableEnv()
         captured = {}
 
@@ -148,7 +174,11 @@ class TestAtomicSnapshotWrite:
             pass
         boot = captured.get("cmd", "")
         assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "$BASHPID" in boot
+        assert "mktemp " in boot
+        assert ".tmp.XXXXXX" in boot
+        assert '"$__hermes_snap_tmp"' in boot
+        assert '${BASHPID:-$$.$RANDOM}' not in boot
+        assert "|| exit 125" in boot
         assert ".tmp.$$" not in boot
 
 
@@ -169,6 +199,86 @@ class TestAtomicSnapshotWrite:
         assert "umask 077" in boot
         assert boot.index("umask 077") < boot.index("export -p")
 
+    @pytest.mark.parametrize(
+        "shell_fault",
+        [
+            (
+                "declare() { if [ \"$1\" = \"-F\" ]; then return 1; fi; "
+                "builtin declare \"$@\"; }"
+            ),
+            "alias() { return 1; }",
+            "mv() { return 1; }",
+        ],
+    )
+    def test_bootstrap_transaction_failure_is_not_published(self, tmp_path, shell_fault):
+        """Any assembly/publish failure must retain the no-snapshot fallback."""
+
+        class FaultEnv(BaseEnvironment):
+            def __init__(self):
+                self.calls = []
+                super().__init__(cwd=str(tmp_path), timeout=10)
+
+            def get_temp_dir(self):
+                return str(tmp_path)
+
+            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+                self.calls.append((cmd_string, login))
+                fault = ""
+                if "mktemp " in cmd_string:
+                    fault = shell_fault + ";\n"
+                return subprocess.Popen(
+                    ["/bin/bash", "-lc" if login else "-c", fault + cmd_string],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+            def cleanup(self):
+                pass
+
+        env = FaultEnv()
+        env.init_session()
+
+        assert env._snapshot_ready is False
+        assert not (tmp_path / f"hermes-snap-{env._session_id}.sh").exists()
+        assert not list(tmp_path.glob(f"hermes-snap-{env._session_id}.sh.tmp.*"))
+
+    def test_missing_mktemp_keeps_per_command_login_shell(self, tmp_path):
+        """Snapshot tooling failure is not evidence that login Bash is broken."""
+
+        class MissingMktempEnv(BaseEnvironment):
+            def __init__(self):
+                self.calls = []
+                super().__init__(cwd=str(tmp_path), timeout=10)
+
+            def get_temp_dir(self):
+                return str(tmp_path)
+
+            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+                self.calls.append((cmd_string, login))
+                fault = "mktemp() { return 127; };\n" if "mktemp " in cmd_string else ""
+                return subprocess.Popen(
+                    ["/bin/bash", "-lc" if login else "-c", fault + cmd_string],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+            def cleanup(self):
+                pass
+
+        env = MissingMktempEnv()
+        env.init_session()
+
+        assert env._snapshot_ready is False
+        assert env._prefer_nonlogin is False
+        env.execute("true")
+        assert env.calls[-1][1] is True
+
 
 class TestAtomicSnapshotConcurrencyBehavioral:
     """Behavioral regression for #38249 — actually EXECUTES the generated
@@ -178,8 +288,8 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     the emitted script's guarantee holds under real concurrency: N concurrent
     writers + readers, and the snapshot is ALWAYS a complete, parseable env
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it uses ``$BASHPID`` (per-subshell
-    unique), which is what closes the race; ``$$`` would still tear here.
+    that would corrupt PATH. ``mktemp`` provides the per-writer unique path on
+    Bash 3.2 too.
     """
 
     def _run(self, script):
@@ -194,11 +304,14 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
+        _snap_template = _q(snap + ".tmp.XXXXXX")
+        _snap_setup = f"__hermes_snap_tmp=$(mktemp {_snap_template} 2>/dev/null) || continue; "
+        _snap_tmp = '"$__hermes_snap_tmp"'
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
+            f"{_snap_setup}"
             f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
             f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
             "done"
@@ -222,27 +335,89 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         final = self._run(f"source {_q(snap)} >/dev/null 2>&1 && echo OK || echo BROKEN")
         assert "OK" in final.stdout, f"final snapshot not sourceable: {final.stdout} {final.stderr}"
 
-    def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path):
-        """If ``export -p`` fails, the ``&&``-chained mv must NOT clobber the
-        existing good snapshot."""
-        import shutil
-        if not shutil.which("bash"):
-            import pytest
-            pytest.skip("bash required")
-        import shlex
-        snap = str(tmp_path / "snap.sh")
-        _q = shlex.quote
-        self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
-        # Redirect export into an unwritable dir so the export side fails; mv
-        # must then NOT run (&&) and not clobber snap.
-        bad_tmp = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID"
-        script = (
-            f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"
+    def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path, monkeypatch):
+        """Generated refresh code must retain the good snapshot on dump failure."""
+        import tools.environments.base as base_module
+
+        env = _TestableEnv()
+        env._snapshot_path = str(tmp_path / "snap.sh")
+        env._snapshot_ready = True
+        original = "export GOOD=1\n"
+        (tmp_path / "snap.sh").write_text(original)
+
+        def failing_dump(tmp_path_expr):
+            return f"{{ printf 'declare -x PARTIAL='; false; }} > {tmp_path_expr}"
+
+        monkeypatch.setattr(base_module, "_export_dump_excluding_session_vars", failing_dump)
+        wrapped = env._wrap_command("true", str(tmp_path))
+
+        result = self._run(wrapped)
+
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "snap.sh").read_text() == original
+        assert not list(tmp_path.glob("snap.sh.tmp.*"))
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group signals required")
+    def test_hard_termination_cleans_snapshot_temp(self, tmp_path, monkeypatch):
+        """TERM during refresh must preserve the good snapshot and clean temp."""
+        import tools.environments.base as base_module
+
+        env = _TestableEnv()
+        env._snapshot_path = str(tmp_path / "snap.sh")
+        env._snapshot_ready = True
+        original = "export GOOD=1\n"
+        (tmp_path / "snap.sh").write_text(original)
+
+        def blocking_dump(tmp_path_expr):
+            return (
+                f"{{ printf 'declare -x PARTIAL=' > {tmp_path_expr}; "
+                "sleep 30; false; }"
+            )
+
+        monkeypatch.setattr(base_module, "_export_dump_excluding_session_vars", blocking_dump)
+        wrapped = env._wrap_command("true", str(tmp_path))
+        proc = subprocess.Popen(
+            ["/bin/bash", "-c", wrapped],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
         )
-        self._run(script)
-        out = self._run(f"cat {_q(snap)}")
-        assert "export GOOD=1" in out.stdout, "good snapshot was destroyed by a failed export"
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if list(tmp_path.glob("snap.sh.tmp.*")):
+                    break
+                time.sleep(0.02)
+            assert list(tmp_path.glob("snap.sh.tmp.*")), "temp was never allocated"
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=5)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and list(tmp_path.glob("snap.sh.tmp.*")):
+                time.sleep(0.02)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+
+        assert (tmp_path / "snap.sh").read_text() == original
+        assert not list(tmp_path.glob("snap.sh.tmp.*"))
+
+    def test_missing_mktemp_preserves_snapshot_and_user_exit_status(self, tmp_path):
+        """Allocation failure skips refresh without clobbering user semantics."""
+        env = _TestableEnv()
+        env._snapshot_path = str(tmp_path / "existing-snap.sh")
+        env._snapshot_ready = True
+        original = "export SNAPSHOT_SENTINEL=1\n"
+        (tmp_path / "existing-snap.sh").write_text(original)
+        wrapped = env._wrap_command("printf 'USER_RAN\\n'; false", str(tmp_path))
+
+        result = self._run("mktemp() { return 127; };\n" + wrapped)
+
+        assert result.returncode == 1, result.stderr
+        assert "USER_RAN" in result.stdout
+        assert (tmp_path / "existing-snap.sh").read_text() == original
+        assert not list(tmp_path.glob("existing-snap.sh.tmp.*"))
 
 
 class TestSnapshotFileModes:

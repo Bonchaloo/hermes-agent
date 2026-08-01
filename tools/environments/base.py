@@ -416,15 +416,13 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     Matrix room/display name via ``HERMES_SESSION_CHAT_NAME``) land in the
     snapshot and execute on the next ``source`` (issue #71296). Unsetting first
     means ``export -p`` never emits those vars — including any continuation
-    lines. ``|| true`` keeps the success contract for callers that chain on it.
+    lines. The final ``export -p`` status must propagate so callers never publish
+    a partial dump after a write failure.
 
     The dump MUST be wrapped in a brace group with the redirection applied to
-    the group. *tmp_path* typically embeds ``$BASHPID`` for concurrency-safe
-    temp names; a redirection attached to a pipeline segment would expand
-    ``$BASHPID`` inside that segment's subshell (a different PID than the
-    parent that expands the follow-up ``mv``), silently orphaning the dump.
-    The brace-group redirect is expanded in the current shell, keeping both
-    expansions consistent.
+    the whole group. *tmp_path* is normally the quoted ``mktemp`` result; the
+    group ensures the export succeeds as one unit before callers atomically
+    publish it with ``mv``.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
@@ -433,7 +431,7 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "HERMES_UI_SESSION_ID 2>/dev/null; "
         "export -p; "
-        ") || true; } "
+        "); } "
         f"> {tmp_path}"
     )
 
@@ -542,19 +540,21 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # Allocate a collision-free same-directory temp file. Apple Bash 3.2
+        # leaves ``$BASHPID`` unset, so a raw ``.tmp.$BASHPID`` suffix collapses
+        # concurrent writers onto one path and defeats the atomic rename.
+        _snap_tmp_setup, _snap_tmp = self._snapshot_temp_shell()
         bootstrap = (
-            f"umask 077\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
+            # Scope cleanup in a subshell so user-defined traps from the login
+            # shell are never replaced.  The trap is installed before secure
+            # allocation and is harmless after a successful atomic rename.
+            f"if ! (\n"
+            f"  __hermes_snap_tmp=\n"
+            f"  trap 'rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true' "
+            f"EXIT HUP INT TERM\n"
+            f"  umask 077\n"
+            f"  {_snap_tmp_setup} || exit 125\n"
+            f"  {_export_dump_excluding_session_vars(_snap_tmp)} || exit 125\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -567,16 +567,30 @@ class BaseEnvironment(ABC):
             # ``declare -f`` with no name args dumps ALL functions, so an empty
             # name list (only private funcs present) would otherwise leak the
             # very functions we meant to drop.
-            f"__hermes_fns=$(declare -F | awk '{{print $3}}' | grep -vE '^_[^_]') || true\n"
-            f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns "
-            f">> {_snap_tmp} 2>/dev/null || true\n"
-            f"alias -p >> {_snap_tmp}\n"
-            f"echo 'shopt -s expand_aliases' >> {_snap_tmp}\n"
-            f"echo 'set +e' >> {_snap_tmp}\n"
-            f"echo 'set +u' >> {_snap_tmp}\n"
+            # Parse with Bash builtins rather than an ``awk | grep`` pipeline:
+            # a legitimate empty function set remains success, while discovery
+            # failure is distinguishable and aborts publication.
+            f"  builtin shopt -u extdebug 2>/dev/null || true\n"
+            f"  __hermes_fn_defs=$(declare -F) || exit 125\n"
+            f"  __hermes_fns=\n"
+            f"  while builtin read -r __hermes_decl __hermes_flag __hermes_name; do\n"
+            f"    [ -n \"$__hermes_name\" ] || continue\n"
+            f"    case \"$__hermes_name\" in _[!_]*) continue ;; esac\n"
+            f"    __hermes_fns=\"${{__hermes_fns}}${{__hermes_name}}\"$'\\n'\n"
+            f"  done <<< \"$__hermes_fn_defs\"\n"
+            f"  if [ -n \"$__hermes_fns\" ]; then\n"
+            f"    declare -f $__hermes_fns >> {_snap_tmp} 2>/dev/null || exit 125\n"
+            f"  fi\n"
+            f"  alias -p >> {_snap_tmp} || exit 125\n"
+            f"  echo 'shopt -s expand_aliases' >> {_snap_tmp} || exit 125\n"
+            f"  echo 'set +e' >> {_snap_tmp} || exit 125\n"
+            f"  echo 'set +u' >> {_snap_tmp} || exit 125\n"
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
+            f"  mv -f {_snap_tmp} {_quoted_snap} || exit 125\n"
+            f"); then\n"
+            f"  exit 125\n"
+            f"fi\n"
             f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -602,14 +616,33 @@ class BaseEnvironment(ABC):
             # would brick every tool — prefer non-login bash -c instead.
             detail = str(exc)
             prefer_nonlogin = False
+            login_usable = False
             try:
-                probe = self._run_bash("true", login=False, timeout=min(15, self._snapshot_timeout))
-                probe_result = self._wait_for_process(probe, timeout=min(15, self._snapshot_timeout))
-                prefer_nonlogin = int(probe_result.get("returncode") or 0) == 0
-                if not prefer_nonlogin:
-                    detail = (probe_result.get("stdout") or detail).strip() or detail
-            except Exception as probe_exc:
-                detail = f"{detail}; non-login probe: {probe_exc}"
+                login_probe = self._run_bash(
+                    "true", login=True, timeout=min(15, self._snapshot_timeout)
+                )
+                login_result = self._wait_for_process(
+                    login_probe, timeout=min(15, self._snapshot_timeout)
+                )
+                login_usable = int(login_result.get("returncode") or 0) == 0
+                if not login_usable:
+                    detail = (login_result.get("stdout") or detail).strip() or detail
+            except Exception as login_probe_exc:
+                detail = f"{detail}; login probe: {login_probe_exc}"
+
+            if not login_usable:
+                try:
+                    probe = self._run_bash(
+                        "true", login=False, timeout=min(15, self._snapshot_timeout)
+                    )
+                    probe_result = self._wait_for_process(
+                        probe, timeout=min(15, self._snapshot_timeout)
+                    )
+                    prefer_nonlogin = int(probe_result.get("returncode") or 0) == 0
+                    if not prefer_nonlogin:
+                        detail = (probe_result.get("stdout") or detail).strip() or detail
+                except Exception as probe_exc:
+                    detail = f"{detail}; non-login probe: {probe_exc}"
 
             self._prefer_nonlogin = prefer_nonlogin
             if prefer_nonlogin:
@@ -651,6 +684,18 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
+    def _snapshot_temp_shell(self) -> tuple[str, str]:
+        """Return shell setup and a quoted ref for a unique snapshot temp.
+
+        ``mktemp`` is available on supported POSIX, Git-Bash, and Termux
+        backends and guarantees uniqueness in the snapshot's directory. If it
+        is unavailable, callers fail closed rather than inventing a predictable
+        PID/random path that could collide or be pre-created.
+        """
+        template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
+        setup = f"__hermes_snap_tmp=$(mktemp {template} 2>/dev/null)"
+        return setup, '"$__hermes_snap_tmp"'
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -662,11 +707,10 @@ class BaseEnvironment(ABC):
         # Use atomic file replacement for env snapshot updates (issue #38249).
         # Assemble into a per-writer-unique temp file, then mv to atomically
         # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # truncated/half-written file. Use mktemp rather than raw ``$BASHPID``:
+        # Apple Bash 3.2 does not define BASHPID, which otherwise makes all
+        # concurrent writers share the same temp path.
+        _snap_tmp_setup, _snap_tmp = self._snapshot_temp_shell()
 
         parts = []
 
@@ -695,20 +739,21 @@ class BaseEnvironment(ABC):
         parts.append("umask 077")
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
-        # Chain mv on the export succeeding so a failed/partial dump never
-        # replaces a good snapshot; drop the temp on failure so it isn't
-        # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the redirection must be attached to a brace group — ``_snap_tmp``
-        # embeds ``$BASHPID``, and a redirect on a pipeline segment expands
-        # inside that segment's subshell (a different PID than the parent that
-        # expands the ``mv`` operand), silently orphaning the dump. See
-        # _export_dump_excluding_session_vars.
+        # Scope cleanup in a subshell so a signal after allocation cannot leave
+        # a private temp behind and user-defined traps remain untouched.
         if self._snapshot_ready:
+            parts.append("(")
+            parts.append("  __hermes_snap_tmp=")
             parts.append(
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
-                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                "  trap 'rm -f \"$__hermes_snap_tmp\" 2>/dev/null || true' "
+                "EXIT HUP INT TERM"
             )
+            parts.append(f"  {_snap_tmp_setup} || exit 0")
+            parts.append(
+                f"  {_export_dump_excluding_session_vars(_snap_tmp)} "
+                f"&& mv -f {_snap_tmp} {_quoted_snap}"
+            )
+            parts.append(") 2>/dev/null || true")
 
         # Emit the CWD stdout marker; all backends (including local, since
         # PR #63255) parse it from output — no temp-file write needed.
