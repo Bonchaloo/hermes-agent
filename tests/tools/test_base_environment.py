@@ -71,7 +71,7 @@ class TestWrapCommand:
         assert "cd -- /tmp" in wrapped or "cd -- '/tmp'" in wrapped
         assert "eval 'echo hello'" in wrapped
         assert "__hermes_ec=$?" in wrapped
-        assert "export -p" in wrapped and "> " in wrapped
+        assert "export -p" in wrapped and ">| " in wrapped
         # cwd travels via the stdout marker only — no temp-file write.
         assert "pwd -P >" not in wrapped
         assert env._cwd_marker in wrapped
@@ -117,7 +117,7 @@ class TestAtomicSnapshotWrite:
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
         # Env dump goes to a temp file, not directly over the live snapshot.
-        assert "export -p" in wrapped and "> " in wrapped
+        assert "export -p" in wrapped and ">| " in wrapped
         assert ".tmp." in wrapped
         # Then an atomic rename onto the real snapshot path.
         assert "mv -f " in wrapped
@@ -198,6 +198,44 @@ class TestAtomicSnapshotWrite:
         boot = captured.get("cmd", "")
         assert "umask 077" in boot
         assert boot.index("umask 077") < boot.index("export -p")
+
+    def test_noclobber_does_not_block_bootstrap_or_refresh(self, tmp_path):
+        """A login profile may enable noclobber; mktemp output already exists,
+        so both transactional writes must explicitly override that option."""
+
+        class NoclobberEnv(BaseEnvironment):
+            def __init__(self):
+                super().__init__(cwd=str(tmp_path), timeout=10)
+
+            def get_temp_dir(self):
+                return str(tmp_path)
+
+            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+                return subprocess.Popen(
+                    [
+                        "/bin/bash",
+                        "-lc" if login else "-c",
+                        "set -o noclobber;\n" + cmd_string,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+            def cleanup(self):
+                pass
+
+        env = NoclobberEnv()
+        env.init_session()
+        assert env._snapshot_ready is True
+
+        result = env.execute("export HERMES_NOCLOBBER_REFRESH=works")
+        assert result["returncode"] == 0
+        snapshot = (tmp_path / f"hermes-snap-{env._session_id}.sh").read_text()
+        assert "HERMES_NOCLOBBER_REFRESH" in snapshot
+        assert not list(tmp_path.glob(f"hermes-snap-{env._session_id}.sh.tmp.*"))
 
     @pytest.mark.parametrize(
         "shell_fault",

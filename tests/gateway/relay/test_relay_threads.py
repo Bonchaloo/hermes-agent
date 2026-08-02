@@ -238,14 +238,37 @@ async def test_send_captures_auto_thread_feedback():
         }
 
     stub.send_outbound = send_outbound  # type: ignore[method-assign]
-    result = await adapter.send("chan1", "quack")
+    result = await adapter.send("chan1", "quack", reply_to="msg-1")
     assert result.success
-    assert adapter.auto_thread_info_for_chat("chan1") == (
+    assert adapter.auto_thread_info_for_chat("chan1", "msg-1") == (
         "th-auto-1",
         "What is a duck",
     )
     # Plain results (no auto-thread) leave no feedback for other chats.
-    assert adapter.auto_thread_info_for_chat("chan-other") is None
+    assert adapter.auto_thread_info_for_chat("chan-other", "msg-1") is None
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_feedback_is_correlated_and_consumed_once():
+    adapter, stub = _adapter()
+
+    async def send_outbound(action, *, platform=None):
+        return {
+            "success": True,
+            "message_id": "m1",
+            "thread_id": "th-current",
+            "auto_thread_name": "Initial title",
+        }
+
+    stub.send_outbound = send_outbound  # type: ignore[method-assign]
+    await adapter.send("chan-parent", "reply", reply_to="msg-current")
+
+    assert adapter.auto_thread_info_for_chat("chan-parent", "msg-old") is None
+    assert adapter.auto_thread_info_for_chat("chan-parent", "msg-current") == (
+        "th-current",
+        "Initial title",
+    )
+    assert adapter.auto_thread_info_for_chat("chan-parent", "msg-current") is None
 
 
 @pytest.mark.asyncio
@@ -256,8 +279,9 @@ async def test_send_without_thread_feedback_leaves_no_info():
         return {"success": True, "message_id": "m2"}
 
     stub.send_outbound = send_outbound  # type: ignore[method-assign]
-    await adapter.send("chan2", "hello")
-    assert adapter.auto_thread_info_for_chat("chan2") is None
+    adapter._auto_thread_by_chat[("chan2", "msg-2")] = ("stale", "Old")
+    await adapter.send("chan2", "hello", reply_to="msg-2")
+    assert adapter.auto_thread_info_for_chat("chan2", "msg-2") is None
 
 
 @pytest.mark.asyncio
@@ -274,10 +298,10 @@ async def test_auto_thread_feedback_is_bounded():
 
     stub.send_outbound = send_outbound  # type: ignore[method-assign]
     for i in range(300):
-        await adapter.send(f"c{i}", "x")
+        await adapter.send(f"c{i}", "x", reply_to=f"m{i}")
     assert len(adapter._auto_thread_by_chat) <= 256
     # Newest entries survive the bound.
-    assert adapter.auto_thread_info_for_chat("c299") == ("th-c299", "n")
+    assert adapter.auto_thread_info_for_chat("c299", "m299") == ("th-c299", "n")
 
 
 # ── title-turn rename: registration shape-gate + fire-time cache poll ────
@@ -314,6 +338,7 @@ def _relay_channel_source():
         chat_id="chan-parent",
         chat_type="group",
         thread_id=None,
+        message_id="msg-current",
         delivered_via_upstream_relay=True,
         auto_thread_created=False,
         auto_thread_initial_name=None,
@@ -374,7 +399,10 @@ async def test_title_rename_polls_feedback_that_arrives_late():
 
     async def land_feedback_late():
         await asyncio.sleep(0.7)  # past the first poll tick
-        adapter._auto_thread_by_chat["chan-parent"] = ("th-9", "Initial words")
+        adapter._auto_thread_by_chat[("chan-parent", "msg-current")] = (
+            "th-9",
+            "Initial words",
+        )
 
     task = asyncio.create_task(land_feedback_late())
     await runner._rename_discord_auto_thread_for_session_title(
@@ -389,6 +417,53 @@ async def test_title_rename_polls_feedback_that_arrives_late():
     # tenant" — the live failure on staging 2026-08-01).
     assert renames == [
         ("th-9", "Debugging the flux capacitor", True, "chan-parent")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_title_rename_ignores_stale_feedback_from_prior_message():
+    """A title for a new parent-channel turn must never consume feedback from
+    an earlier triggering message while current-send feedback is still racing."""
+    import asyncio
+
+    adapter, _ = _adapter()
+    renames: list = []
+
+    async def rename_thread(
+        thread_id,
+        name,
+        *,
+        only_if_current_name=None,
+        prefer_connector_created=False,
+        parent_chat_id=None,
+    ):
+        renames.append((thread_id, name, prefer_connector_created, parent_chat_id))
+        return True
+
+    adapter.rename_thread = rename_thread  # type: ignore[method-assign]
+    adapter._auto_thread_by_chat[("chan-parent", "msg-old")] = (
+        "th-stale",
+        "Old title",
+    )
+    runner = _mk_runner_stub()(adapter)
+    src = _relay_channel_source()
+    src.message_id = "msg-current"
+
+    async def land_current_feedback():
+        await asyncio.sleep(0.7)
+        adapter._auto_thread_by_chat[("chan-parent", "msg-current")] = (
+            "th-current",
+            "Current initial title",
+        )
+
+    task = asyncio.create_task(land_current_feedback())
+    await runner._rename_discord_auto_thread_for_session_title(
+        src, "sess-current", "Current semantic title"
+    )
+    await task
+
+    assert renames == [
+        ("th-current", "Current semantic title", True, "chan-parent")
     ]
 
 

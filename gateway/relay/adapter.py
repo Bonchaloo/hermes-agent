@@ -72,11 +72,11 @@ class RelayAdapter(BasePlatformAdapter):
         # recipient's author binding; we re-attach this user_id as
         # metadata.user_id on the outbound action so it can. See _capture_scope.
         self._dm_user_by_chat: Dict[str, str] = {}
-        # chat_id -> (thread_id, initial_name) of the auto-thread the CONNECTOR
-        # created for our most recent send into that chat (auto-thread routing
-        # feedback off SendResult — see send()). Consumed by the gateway's
-        # semantic thread-rename lane; bounded like the sibling caches.
-        self._auto_thread_by_chat: Dict[str, Tuple[str, str]] = {}
+        # (chat_id, triggering_message_id) -> (thread_id, initial_name) of the
+        # auto-thread the CONNECTOR created for that exact reply. The message
+        # correlation prevents a later title turn in the same parent channel
+        # from consuming stale feedback. Reads pop entries exactly once.
+        self._auto_thread_by_chat: Dict[Tuple[str, str], Tuple[str, str]] = {}
         # chat_id -> chat_type (e.g. "dm", "channel", "group") learned from the
         # inbound event. Used to reproduce native Slack's synthetic-DM-thread
         # suppression on the relay lane: a DM streaming reply carries
@@ -954,11 +954,15 @@ class RelayAdapter(BasePlatformAdapter):
         try:
             _at_thread = result.get("thread_id")
             _at_name = result.get("auto_thread_name")
-            if _at_thread and _at_name:
-                self._auto_thread_by_chat[str(chat_id)] = (
-                    str(_at_thread),
-                    str(_at_name),
-                )
+            _trigger_message = str(reply_to) if reply_to is not None else ""
+            if _trigger_message:
+                _feedback_key = (str(chat_id), _trigger_message)
+                self._auto_thread_by_chat.pop(_feedback_key, None)
+                if _at_thread and _at_name:
+                    self._auto_thread_by_chat[_feedback_key] = (
+                        str(_at_thread),
+                        str(_at_name),
+                    )
                 if len(self._auto_thread_by_chat) > 256:
                     self._auto_thread_by_chat.pop(
                         next(iter(self._auto_thread_by_chat)), None
@@ -972,12 +976,19 @@ class RelayAdapter(BasePlatformAdapter):
         )
 
     def auto_thread_info_for_chat(
-        self, chat_id: str
+        self, chat_id: str, triggering_message_id: str
     ) -> Optional[Tuple[str, str]]:
         """(thread_id, initial_name) of the auto-thread the connector created
-        for the most recent send into *chat_id*, if any. Consumed by the
-        gateway's semantic thread-rename lane (auto session title)."""
-        return self._auto_thread_by_chat.get(str(chat_id))
+        for the reply to *triggering_message_id* in *chat_id*, if any.
+
+        Feedback is consumed exactly once so retries cannot rename a thread
+        after another title lane already handled it.
+        """
+        if not triggering_message_id:
+            return None
+        return self._auto_thread_by_chat.pop(
+            (str(chat_id), str(triggering_message_id)), None
+        )
 
     def _resolve_reply_to_for_send(
         self,

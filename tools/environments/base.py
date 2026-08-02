@@ -435,7 +435,8 @@ def _export_dump_excluding_session_vars(
     The dump MUST be wrapped in a brace group with the redirection applied to
     the whole group. *tmp_path* is normally the quoted ``mktemp`` result; the
     group ensures the export succeeds as one unit before callers atomically
-    publish it with ``mv``.
+    publish it with ``mv``. Use ``>|`` because ``mktemp`` already created the
+    target and a login profile may legitimately enable Bash ``noclobber``.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
@@ -454,7 +455,7 @@ def _export_dump_excluding_session_vars(
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; "
         "); } "
-        f"> {tmp_path}"
+        f">| {tmp_path}"
     )
 
 

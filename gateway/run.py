@@ -19065,12 +19065,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         if not getattr(source, "delivered_via_upstream_relay", False):
             return None
+        triggering_message_id = getattr(source, "message_id", None)
+        if not triggering_message_id:
+            return None
         adapter = self._adapter_for_source(source)
         info_fn = getattr(adapter, "auto_thread_info_for_chat", None)
         if not callable(info_fn):
             return None
         try:
-            info = info_fn(str(source.chat_id))
+            info = info_fn(str(source.chat_id), str(triggering_message_id))
             if (
                 isinstance(info, tuple)
                 and len(info) == 2
