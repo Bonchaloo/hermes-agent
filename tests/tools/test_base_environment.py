@@ -345,7 +345,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         original = "export GOOD=1\n"
         (tmp_path / "snap.sh").write_text(original)
 
-        def failing_dump(tmp_path_expr):
+        def failing_dump(tmp_path_expr, excluded_names=()):
             return f"{{ printf 'declare -x PARTIAL='; false; }} > {tmp_path_expr}"
 
         monkeypatch.setattr(base_module, "_export_dump_excluding_session_vars", failing_dump)
@@ -368,7 +368,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         original = "export GOOD=1\n"
         (tmp_path / "snap.sh").write_text(original)
 
-        def blocking_dump(tmp_path_expr):
+        def blocking_dump(tmp_path_expr, excluded_names=()):
             return (
                 f"{{ printf 'declare -x PARTIAL=' > {tmp_path_expr}; "
                 "sleep 30; false; }"
