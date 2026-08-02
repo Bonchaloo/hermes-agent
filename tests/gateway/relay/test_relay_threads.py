@@ -393,6 +393,46 @@ async def test_title_rename_polls_feedback_that_arrives_late():
 
 
 @pytest.mark.asyncio
+async def test_native_title_rename_keeps_native_adapter_signature():
+    """The native adapter must not receive relay-only keyword arguments."""
+    from types import SimpleNamespace
+
+    native_calls: list[tuple[str, str, str | None]] = []
+
+    class NativeAdapter:
+        async def rename_thread(
+            self,
+            thread_id,
+            name,
+            *,
+            only_if_current_name=None,
+        ):
+            native_calls.append((thread_id, name, only_if_current_name))
+            return True
+
+    runner = _mk_runner_stub()(NativeAdapter())
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_id="native-thread",
+        chat_type="thread",
+        thread_id="native-thread",
+        delivered_via_upstream_relay=False,
+        auto_thread_created=True,
+        auto_thread_initial_name="raw prompt",
+    )
+
+    await runner._rename_discord_auto_thread_for_session_title(
+        source,
+        "sess-native",
+        "Semantic title",
+    )
+
+    assert native_calls == [
+        ("native-thread", "Semantic title", "raw prompt")
+    ]
+
+
+@pytest.mark.asyncio
 async def test_title_rename_true_miss_noops(monkeypatch):
     """No feedback ever arrives (connector didn't auto-thread): no rename."""
     import gateway.run as run_mod
