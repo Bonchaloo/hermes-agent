@@ -150,6 +150,7 @@ class TestAtomicSnapshotWrite:
         assert ".tmp.XXXXXX" in wrapped
         assert '"$__hermes_snap_tmp"' in wrapped
         assert '${BASHPID:-$$.$RANDOM}' not in wrapped
+        assert "$BASHPID" not in wrapped
         assert "__hermes_snap_tmp=$(mktemp " in wrapped
         assert "|| exit 0" in wrapped
         assert wrapped.index("trap '") < wrapped.index("mktemp ")
@@ -178,6 +179,7 @@ class TestAtomicSnapshotWrite:
         assert ".tmp.XXXXXX" in boot
         assert '"$__hermes_snap_tmp"' in boot
         assert '${BASHPID:-$$.$RANDOM}' not in boot
+        assert "$BASHPID" not in boot
         assert "|| exit 125" in boot
         assert ".tmp.$$" not in boot
 
