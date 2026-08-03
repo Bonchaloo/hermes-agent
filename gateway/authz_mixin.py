@@ -683,6 +683,15 @@ class GatewayAuthorizationMixin:
                 extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
                 if source.chat_type in {"group", "forum", "channel"}:
                     adapter_allow = extra.get("group_allow_from")
+                    if not adapter_allow and source.platform == Platform.DISCORD:
+                        # Discord has one user allowlist for both DMs and guild
+                        # traffic. Preserve the registered transport adapter's
+                        # resolved intake list instead of requiring the generic
+                        # group_allow_from key that Discord does not expose.
+                        resolved_allow = getattr(adapter, "_allowed_user_ids", None)
+                        adapter_allow = list(resolved_allow) if resolved_allow else None
+                        if not adapter_allow:
+                            adapter_allow = extra.get("allow_from")
                 else:
                     adapter_allow = extra.get("allow_from")
                 if adapter_allow:

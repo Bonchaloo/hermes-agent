@@ -6,8 +6,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent import secret_scope
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource
+from plugins.platforms.discord.adapter import DiscordAdapter, _GATE_ENV_KEYS
 
 
 _AUTH_GATES = (
@@ -27,20 +28,28 @@ def _reset_multiplex_scope():
     secret_scope.set_multiplex_active(False)
 
 
-def _runner(*, default_extra=None, secondary_extra=None):
+def _runner(
+    *,
+    default_extra=None,
+    secondary_extra=None,
+    default_adapter=None,
+    secondary_adapter=None,
+):
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
-    default_adapter = SimpleNamespace(
-        authorization_is_upstream=False,
-        enforces_own_access_policy=False,
-        config=SimpleNamespace(extra=default_extra or {}),
-    )
-    secondary_adapter = SimpleNamespace(
-        authorization_is_upstream=False,
-        enforces_own_access_policy=False,
-        config=SimpleNamespace(extra=secondary_extra or {}),
-    )
+    if default_adapter is None:
+        default_adapter = SimpleNamespace(
+            authorization_is_upstream=False,
+            enforces_own_access_policy=False,
+            config=SimpleNamespace(extra=default_extra or {}),
+        )
+    if secondary_adapter is None:
+        secondary_adapter = SimpleNamespace(
+            authorization_is_upstream=False,
+            enforces_own_access_policy=False,
+            config=SimpleNamespace(extra=secondary_extra or {}),
+        )
     runner.adapters = {Platform.DISCORD: default_adapter}
     runner._profile_adapters = {
         "secondary": {Platform.DISCORD: secondary_adapter}
@@ -52,6 +61,39 @@ def _runner(*, default_extra=None, secondary_extra=None):
     runner.pairing_store.is_approved.return_value = False
     runner.pairing_stores = {"secondary": pairing_store}
     return runner
+
+
+def _discord_adapter(*, allow_from: str) -> DiscordAdapter:
+    adapter = object.__new__(DiscordAdapter)
+    adapter.platform = Platform.DISCORD
+    adapter.config = PlatformConfig(
+        enabled=True,
+        token="test-token",
+        extra={"allow_from": allow_from},
+    )
+    adapter._gate_env_snapshot = {key: "" for key in _GATE_ENV_KEYS}
+    adapter._allowed_user_ids = adapter._get_allowed_users()
+    adapter._allowed_role_ids = set()
+    adapter._is_pairing_approved_user = lambda _user_id: False
+    return adapter
+
+
+def _discord_runner(*, allow_from: str):
+    adapter = _discord_adapter(allow_from=allow_from)
+    runner = _runner(secondary_adapter=adapter)
+    runner._profile_name_for_source = lambda _source: "secondary"
+    adapter.gateway_runner = runner
+    return runner, adapter
+
+
+def _discord_source(adapter: DiscordAdapter, *, user_id: str, chat_type: str):
+    return adapter.build_source(
+        chat_id=f"{chat_type}-1",
+        user_id=user_id,
+        user_name=user_id,
+        chat_type=chat_type,
+        thread_id="thread-1" if chat_type == "thread" else None,
+    )
 
 
 def _source(profile="secondary") -> SessionSource:
@@ -148,5 +190,53 @@ def test_multiplex_profile_adapter_allow_all_is_not_borrowed_across_profiles(
         )
 
         assert runner._is_user_authorized(_source(source_profile)) is False
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+
+@pytest.mark.parametrize("chat_type", ("dm", "group", "thread"))
+def test_discord_yaml_allow_from_survives_intake_and_final_authorizer(
+    monkeypatch, chat_type
+):
+    monkeypatch.delenv("DISCORD_ALLOWED_USERS", raising=False)
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({})
+    try:
+        runner, adapter = _discord_runner(allow_from="trusted-user")
+        source = _discord_source(
+            adapter,
+            user_id="trusted-user",
+            chat_type=chat_type,
+        )
+
+        assert adapter._is_allowed_user(
+            "trusted-user",
+            is_dm=chat_type == "dm",
+        ) is True
+        assert runner._is_user_authorized(source) is True
+    finally:
+        secret_scope.reset_secret_scope(token)
+
+
+@pytest.mark.parametrize("chat_type", ("dm", "group", "thread"))
+def test_discord_yaml_allow_from_does_not_borrow_process_global_grant(
+    monkeypatch, chat_type
+):
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "other-user")
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({})
+    try:
+        runner, adapter = _discord_runner(allow_from="trusted-user")
+        source = _discord_source(
+            adapter,
+            user_id="other-user",
+            chat_type=chat_type,
+        )
+
+        assert adapter._is_allowed_user(
+            "other-user",
+            is_dm=chat_type == "dm",
+        ) is False
+        assert runner._is_user_authorized(source) is False
     finally:
         secret_scope.reset_secret_scope(token)
