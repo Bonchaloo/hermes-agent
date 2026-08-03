@@ -374,7 +374,20 @@ class TestFailureAttribution:
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(
-            json.dumps({"version": 1, "credential_pool": {"anthropic": entries}})
+            json.dumps(
+                {
+                    "version": 1,
+                    "credential_pool": {"anthropic": entries},
+                    # Manual entries make Anthropic an explicitly configured
+                    # provider, which intentionally enables discovery of
+                    # ~/.claude and Hermes PKCE credentials.  This fixture's
+                    # declared entries must be the complete pool regardless
+                    # of the developer machine running the test.
+                    "suppressed_sources": {
+                        "anthropic": ["claude_code", "hermes_pkce"]
+                    },
+                }
+            )
         )
         from agent.credential_pool import load_pool
 
