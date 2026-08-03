@@ -816,6 +816,22 @@ class TestCounts:
 
 
 
+    def test_session_count_ge_empty(self, db):
+        """session_count_ge should return False for 0 sessions."""
+        assert db.session_count_ge(1) is False
+        assert db.session_count_ge(2) is False
+
+    def test_session_count_ge_at_threshold(self, db):
+        """session_count_ge should True when count >= n."""
+        db.create_session("s1", "cli")
+        assert db.session_count_ge(1) is True
+        assert db.session_count_ge(2) is False
+
+        db.create_session("s2", "telegram")
+        assert db.session_count_ge(1) is True
+        assert db.session_count_ge(2) is True
+        assert db.session_count_ge(3) is False
+
     def test_message_count_total(self, db):
         assert db.message_count() == 0
         db.create_session(session_id="s1", source="cli")
@@ -1834,6 +1850,88 @@ class TestCompressionChainProjection:
         assert tip_row["preview"].startswith("latest message")
         assert tip_row["ended_at"] is None  # tip is still live
         assert tip_row["end_reason"] is None
+
+    def test_list_projects_multiple_independent_chains_in_one_call(self, db):
+        """Two unrelated compression chains in the same page must each
+        resolve to their own tip, not get cross-mixed by the batched tip-row
+        fetch (regression test for the single-query batch in
+        _get_session_rich_rows_batch — a wrong id->row mapping there would
+        silently swap one chain's data onto the other)."""
+        import time as _time
+
+        t0 = _time.time() - 7200
+        self._build_compression_chain(db, t0)
+
+        # Second, independent chain — same shape, different ids/content.
+        db.create_session("root2", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "root2"))
+        db.append_message("root2", "user", "second conversation start")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t0 + 200, "compression", "root2"),
+        )
+        db.create_session("tip2", "cli", parent_session_id="root2")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 201, "tip2"))
+        db.append_message("tip2", "user", "second conversation continuation")
+        db.update_session_cwd("tip2", "/tmp/workspaces/second")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        ids = [s["id"] for s in sessions]
+        assert "root1" not in ids and "root2" not in ids
+        assert "tip1" in ids and "tip2" in ids
+
+        tip1_row = next(s for s in sessions if s["id"] == "tip1")
+        tip2_row = next(s for s in sessions if s["id"] == "tip2")
+        assert tip1_row["_lineage_root_id"] == "root1"
+        assert tip1_row["preview"].startswith("latest message")
+        assert tip2_row["_lineage_root_id"] == "root2"
+        assert tip2_row["preview"].startswith("second conversation continuation")
+        assert tip2_row["cwd"] == "/tmp/workspaces/second"
+
+    def test_list_batches_tip_row_fetch_into_one_query(self, db, monkeypatch):
+        """Projection must resolve tip rows for a whole page in one batched
+        query, not one _get_session_rich_row() call per compression root."""
+        import time as _time
+
+        t0 = _time.time() - 7200
+        self._build_compression_chain(db, t0)
+        db.create_session("root2", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 100, "root2"))
+        db.append_message("root2", "user", "second conversation start")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t0 + 200, "compression", "root2"),
+        )
+        db.create_session("tip2", "cli", parent_session_id="root2")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 201, "tip2"))
+        db.append_message("tip2", "user", "second continuation")
+        db._conn.commit()
+
+        batch_calls = []
+        single_calls = []
+        original_batch = db._get_session_rich_rows_batch
+        original_single = db._get_session_rich_row
+
+        def counting_batch(session_ids, **kwargs):
+            batch_calls.append(list(session_ids))
+            return original_batch(session_ids, **kwargs)
+
+        def counting_single(session_id, **kwargs):
+            single_calls.append(session_id)
+            return original_single(session_id, **kwargs)
+
+        monkeypatch.setattr(db, "_get_session_rich_rows_batch", counting_batch)
+        monkeypatch.setattr(db, "_get_session_rich_row", counting_single)
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        assert len(sessions) >= 2  # sanity: both chains actually surfaced
+
+        # Two compression roots resolved with exactly one batched call, and
+        # zero single-row calls — not one single-row call per root.
+        assert len(batch_calls) == 1
+        assert set(batch_calls[0]) == {"tip1", "tip2"}
+        assert single_calls == []
 
 
 
@@ -3262,6 +3360,48 @@ class TestCompactRows:
         assert "system_prompt" not in row
         assert row["id"] == "s1"
 
+    def test_batch_compact_rows_omits_system_prompt_keeps_git_fields(self, db):
+        """_get_session_rich_rows_batch(compact_rows=True) must apply the same
+        schema-derived compact projection as the single-row path: no
+        system_prompt blob, but git_branch/git_repo_root still present."""
+        self._create(db, "s1", system_prompt="should be gone")
+        db.update_session_cwd("s1", "/tmp/w1", git_branch="main", git_repo_root="/tmp/w1")
+        rows = db._get_session_rich_rows_batch(["s1"], compact_rows=True)
+        assert set(rows) == {"s1"}
+        row = rows["s1"]
+        assert "system_prompt" not in row
+        assert row["git_branch"] == "main"
+        assert row["git_repo_root"] == "/tmp/w1"
+
+    def test_compression_tip_projection_threads_compact_rows(self, db):
+        """list_sessions_rich(compact_rows=True) must thread compact_rows
+        through the batched tip-row fetch: the projected tip row must lack
+        system_prompt but keep git metadata (guards the call site at the
+        projection loop, not just the batch helper)."""
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("rootc", "cli")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "rootc"))
+        db.append_message("rootc", "user", "start")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
+            (t0 + 100, "compression", "rootc"),
+        )
+        db.create_session("tipc", "cli", parent_session_id="rootc")
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 101, "tipc"))
+        db.append_message("tipc", "user", "continuation")
+        db.update_system_prompt("tipc", "big blob " * 500)
+        db.update_session_cwd("tipc", "/tmp/w2", git_branch="dev", git_repo_root="/tmp/w2")
+        db._conn.commit()
+
+        rows = db.list_sessions_rich(source="cli", compact_rows=True)
+        tip = next(s for s in rows if s["id"] == "tipc")
+        assert tip["_lineage_root_id"] == "rootc"
+        assert "system_prompt" not in tip
+        assert tip["git_branch"] == "dev"
+        assert tip["git_repo_root"] == "/tmp/w2"
+
 
 
 
@@ -3641,3 +3781,62 @@ class TestApplyDatabasePragmas:
             assert conn.execute("PRAGMA wal_autocheckpoint").fetchone()[0] == before
         finally:
             conn.close()
+class TestInsightsToolCallIndex:
+    """The Insights assistant tool-call scan has a predicate-aligned index.
+
+    ``InsightsEngine._get_tool_usage`` / ``_get_skill_usage`` filter messages by
+    ``role = 'assistant' AND tool_calls IS NOT NULL``.  A partial index over that
+    predicate keeps the scan off the full ``messages`` table on a large state.db.
+    """
+
+    _INDEX = "idx_messages_assistant_calls_by_session"
+
+    def _index_defn(self, conn):
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (self._INDEX,),
+        ).fetchone()
+        return row["sql"] if row else None
+
+    def test_index_created_on_fresh_db(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "fresh.db")
+        try:
+            sql = self._index_defn(db._conn)
+            assert sql is not None, "partial index missing on a fresh database"
+            # Partial predicate must match the queried rows exactly.
+            assert "role = 'assistant'" in sql
+            assert "tool_calls IS NOT NULL" in sql
+        finally:
+            db.close()
+
+    def test_index_created_on_existing_db(self, tmp_path):
+        """Reopening a DB that predates the index must create it (SCHEMA_SQL is
+        re-run on every open; role/tool_calls are original base columns)."""
+        db_path = tmp_path / "legacy.db"
+        db = SessionDB(db_path=db_path)
+        # Simulate a database created before the index shipped.
+        db._conn.execute(f"DROP INDEX IF EXISTS {self._INDEX}")
+        db._conn.commit()
+        assert self._index_defn(db._conn) is None
+        db.close()
+
+        db2 = SessionDB(db_path=db_path)
+        try:
+            assert self._index_defn(db2._conn) is not None, (
+                "index not recreated when reopening an existing database"
+            )
+        finally:
+            db2.close()
+
+    def test_index_predicate_is_partial(self, db):
+        """The index covers only the assistant tool-call rows Insights reads.
+
+        Query-plan coverage (that the Insights queries actually select this
+        index, for both scopes, without ANALYZE) lives with the queries in
+        tests/agent/test_insights.py.
+        """
+        sql = self._index_defn(db._conn)
+        assert sql is not None
+        assert "WHERE" in sql
+        assert "role = 'assistant'" in sql
+        assert "tool_calls IS NOT NULL" in sql

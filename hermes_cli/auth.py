@@ -648,42 +648,94 @@ ZAI_ENDPOINTS = [
 ]
 
 
+def _probe_single_zai_endpoint(
+    api_key: str, endpoint: tuple, timeout: float,
+) -> Optional[Dict[str, str]]:
+    """Probe a single Z.AI endpoint. Returns endpoint info dict or None.
+
+    Preserves the per-endpoint candidate-model loop: endpoints carry a
+    ``probe_models`` LIST and each model is tried in order until one
+    succeeds (some plans only accept newer/older GLM slugs).
+    """
+    ep_id, base_url, probe_models, label = endpoint
+    for model in probe_models:
+        try:
+            resp = httpx.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "stream": False,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                logger.debug("Z.AI endpoint probe: %s (%s) model=%s OK", ep_id, base_url, model)
+                return {
+                    "id": ep_id,
+                    "base_url": base_url,
+                    "model": model,
+                    "label": label,
+                }
+            logger.debug("Z.AI endpoint probe: %s model=%s returned %s", ep_id, model, resp.status_code)
+        except Exception as exc:
+            logger.debug("Z.AI endpoint probe: %s model=%s failed: %s", ep_id, model, exc)
+    return None
+
+
 def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str, str]]:
-    """Probe z.ai endpoints to find one that accepts this API key.
+    """Probe z.ai endpoints in parallel to find one that accepts this API key.
 
     Returns {"id": ..., "base_url": ..., "model": ..., "label": ...} for the
-    first working endpoint, or None if all fail.  For endpoints with multiple
-    candidate models, tries each in order and returns the first that succeeds.
+    first working endpoint (in ZAI_ENDPOINTS priority order), or None if all
+    fail.  For endpoints with multiple candidate models, each worker tries
+    its endpoint's models in order and returns the first that succeeds.
     """
-    for ep_id, base_url, probe_models, label in ZAI_ENDPOINTS:
-        for model in probe_models:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # No `with` block: a context manager would join ALL probe threads on
+    # exit, defeating the early return below. shutdown(wait=False) lets the
+    # surviving daemon-style probes drain in the background instead of
+    # blocking the caller on slow/unreachable endpoints.
+    pool = ThreadPoolExecutor(max_workers=len(ZAI_ENDPOINTS))
+    try:
+        futures = {
+            pool.submit(_probe_single_zai_endpoint, api_key, ep, timeout): ep[0]
+            for ep in ZAI_ENDPOINTS
+        }
+        by_id = {ep_id: f for f, ep_id in futures.items()}
+        results: Dict[str, Dict[str, str]] = {}
+        for future in as_completed(futures):
+            ep_id = futures[future]
             try:
-                resp = httpx.post(
-                    f"{base_url}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": model,
-                        "stream": False,
-                        "max_tokens": 1,
-                        "messages": [{"role": "user", "content": "ping"}],
-                    },
-                    timeout=timeout,
-                )
-                if resp.status_code == 200:
-                    logger.debug("Z.AI endpoint probe: %s (%s) model=%s OK", ep_id, base_url, model)
-                    return {
-                        "id": ep_id,
-                        "base_url": base_url,
-                        "model": model,
-                        "label": label,
-                    }
-                logger.debug("Z.AI endpoint probe: %s model=%s returned %s", ep_id, model, resp.status_code)
-            except Exception as exc:
-                logger.debug("Z.AI endpoint probe: %s model=%s failed: %s", ep_id, model, exc)
-    return None
+                result = future.result()
+                if result is not None:
+                    results[ep_id] = result
+            except Exception:
+                pass
+            # Early exit in PRIORITY order: walk endpoints highest-priority
+            # first; if one has succeeded and every higher-priority probe
+            # has already finished (without success), no later completion
+            # can win — return now instead of waiting out slow endpoints
+            # (main's sequential loop also stopped at first success).
+            for ep in ZAI_ENDPOINTS:
+                if not by_id[ep[0]].done():
+                    break  # a higher-priority probe is still in flight
+                if ep[0] in results:
+                    return results[ep[0]]
+
+        # All probes finished: first match in priority order, if any.
+        for ep in ZAI_ENDPOINTS:
+            if ep[0] in results:
+                return results[ep[0]]
+        return None
+    finally:
+        pool.shutdown(wait=False)
 
 
 def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> str:
