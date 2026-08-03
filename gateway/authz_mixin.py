@@ -31,29 +31,30 @@ from gateway.whatsapp_identity import (
 def _platform_gate_env(name: str, default: str = "") -> str:
     """Read an authorization gate env var with per-profile isolation.
 
-    The profile secret scope is authoritative under multiplex: when a scope
-    is installed AND multiplexing is active, a key absent from
-    the scope returns ``default`` instead of falling through to
-    ``os.environ``. Under multiplex the process env may hold ANOTHER
-    profile's first-writer-bridged value (the YAML→env bridges in the
+    The profile secret scope is authoritative under multiplex. A missing scope
+    or a key absent from the installed scope returns ``default`` instead of
+    falling through to ``os.environ``. Under multiplex the process env may hold
+    ANOTHER profile's first-writer-bridged value (the YAML→env bridges in the
     Discord/Telegram adapters' ``_apply_yaml_config`` are first-writer-wins),
     so falling through would leak profile A's allowlist into profile B
-    (issue #72348). Single-profile deployments — no scope installed, or
-    multiplex off — behave exactly like the legacy ``os.getenv`` read.
+    (issue #72348). Single-profile deployments — multiplex off — behave exactly
+    like the legacy ``os.getenv`` read.
     """
     if not name:
         return default
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
-        scope = current_secret_scope()
-        if scope is not None and is_multiplex_active():
+        if is_multiplex_active():
+            scope = current_secret_scope()
+            if scope is None:
+                return default
             val = scope.get(name)
             if val is None:
                 return default
             return str(val).strip()
     except Exception:
-        pass
+        return default
     return (os.getenv(name) or default).strip()
 
 

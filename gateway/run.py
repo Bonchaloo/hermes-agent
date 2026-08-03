@@ -10401,7 +10401,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # receive a full agent response on gateway restart just
             # because it has a resume-pending marker (issue #23778).
             try:
-                if not self._is_user_authorized(source):
+                if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                    with _profile_runtime_scope(
+                        self._resolve_profile_home_for_source(source)
+                    ):
+                        authorized = self._is_user_authorized(source)
+                else:
+                    authorized = self._is_user_authorized(source)
+                if not authorized:
                     logger.warning(
                         "Skipping auto-resume for %s: session owner is no "
                         "longer authorized under the current allowlist",

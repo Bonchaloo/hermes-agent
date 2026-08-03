@@ -27,6 +27,7 @@ PRs #9850, #9934, #7536):
 
 import asyncio
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -614,6 +615,59 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
     # No slot was claimed and nothing was persisted for the skipped session.
     assert pending_entry.session_key not in runner._running_agents
     runner._persist_active_agents.assert_not_called()
+
+
+def test_startup_auto_resume_authorizes_under_persisted_profile_scope(tmp_path, monkeypatch):
+    """Startup recovery must not authorize a secondary source unscoped."""
+    from agent import secret_scope
+    from gateway import run as gateway_run
+
+    runner, adapter = make_restart_runner()
+    runner.config.multiplex_profiles = True
+    runner._active_profile_name = lambda: "default"
+    runner._profile_adapters = {"secondary": {Platform.TELEGRAM: adapter}}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="secondary-chat",
+        chat_type="dm",
+        user_id="u1",
+        profile="secondary",
+    )
+    pending_entry = SessionEntry(
+        session_key="agent:secondary:telegram:dm:secondary-chat",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    profile_home = tmp_path / "profiles" / "secondary"
+    runner._resolve_profile_home_for_source = MagicMock(return_value=profile_home)
+    observed_scopes = []
+
+    @contextmanager
+    def fake_profile_scope(home):
+        token = secret_scope.set_secret_scope({"PROFILE_HOME": str(home)})
+        try:
+            yield
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    def authorize(_source):
+        observed_scopes.append(secret_scope.current_secret_scope())
+        return False
+
+    runner._is_user_authorized = authorize
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_profile_scope)
+
+    assert runner._schedule_resume_pending_sessions() == 0
+    runner._resolve_profile_home_for_source.assert_called_once_with(source)
+    assert observed_scopes == [{"PROFILE_HOME": str(profile_home)}]
 
 
 @pytest.mark.asyncio

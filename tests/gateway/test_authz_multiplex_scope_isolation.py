@@ -75,6 +75,20 @@ def test_multiplex_scoped_miss_does_not_borrow_process_auth_gate(
 
 
 @pytest.mark.parametrize(("env_name", "env_value"), _AUTH_GATES)
+def test_multiplex_unscoped_auth_does_not_borrow_process_auth_gate(
+    monkeypatch, env_name, env_value
+):
+    """Missing caller scope must fail closed while multiplexing is active."""
+    for name, _ in _AUTH_GATES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(env_name, env_value)
+
+    secret_scope.set_multiplex_active(True)
+
+    assert _runner()._is_user_authorized(_source()) is False
+
+
+@pytest.mark.parametrize(("env_name", "env_value"), _AUTH_GATES)
 def test_multiplex_scoped_auth_gate_still_authorizes(
     monkeypatch, env_name, env_value
 ):
