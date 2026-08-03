@@ -556,6 +556,22 @@ class GatewayAuthorizationMixin:
         if platform_allow_all_var and _platform_gate_env(platform_allow_all_var).lower() in {"true", "1", "yes"}:
             return True
 
+        # Discord's profile loader seeds config.yaml authorization gates into
+        # the live adapter's PlatformConfig.extra. Under multiplexing it
+        # intentionally does not bridge those values into process-global env,
+        # so consult only the profile-bound adapter selected by this source.
+        # _adapter_for_source() fails closed for a missing secondary registry
+        # and never falls back to another profile's Discord adapter.
+        if source.platform == Platform.DISCORD:
+            adapter = self._adapter_for_source(source)
+            extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+            if str(extra.get("allow_all_users", "")).strip().lower() in {
+                "true",
+                "1",
+                "yes",
+            }:
+                return True
+
         # Adapter-verified role auth: the Discord adapter already confirmed the
         # user holds a role in DISCORD_ALLOWED_ROLES before dispatching the message.
         # Compare with ``is True`` so the real bool field authorizes while a
