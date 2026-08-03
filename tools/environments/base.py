@@ -512,7 +512,7 @@ def _export_dump_excluding_session_vars(
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID HERMES_CRON_SESSION{extra_unset} 2>/dev/null; "
         "export -p; "
         "); } "
         f">| {tmp_path}"

@@ -28,26 +28,11 @@ from gateway.whatsapp_identity import (
 )
 
 
-def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
-    if not name:
-        return default
-    try:
-        from agent.secret_scope import get_secret
-
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
-
-
 def _platform_gate_env(name: str, default: str = "") -> str:
-    """Read a platform allow/deny gate env var with per-profile isolation.
+    """Read an authorization gate env var with per-profile isolation.
 
-    Like ``_auth_env`` but authoritative under multiplex: when a profile
-    secret scope is installed AND multiplexing is active, a key absent from
+    The profile secret scope is authoritative under multiplex: when a scope
+    is installed AND multiplexing is active, a key absent from
     the scope returns ``default`` instead of falling through to
     ``os.environ``. Under multiplex the process env may hold ANOTHER
     profile's first-writer-bridged value (the YAML→env bridges in the
@@ -567,7 +552,7 @@ class GatewayAuthorizationMixin:
 
         # Per-platform allow-all flag (e.g., DISCORD_ALLOW_ALL_USERS=true)
         platform_allow_all_var = platform_allow_all_map.get(source.platform, "")
-        if platform_allow_all_var and _auth_env(platform_allow_all_var).lower() in {"true", "1", "yes"}:
+        if platform_allow_all_var and _platform_gate_env(platform_allow_all_var).lower() in {"true", "1", "yes"}:
             return True
 
         # Adapter-verified role auth: the Discord adapter already confirmed the
@@ -598,13 +583,13 @@ class GatewayAuthorizationMixin:
             return True
 
         # Check platform-specific and global allowlists
-        platform_allowlist = _auth_env(platform_env_map.get(source.platform, ""))
+        platform_allowlist = _platform_gate_env(platform_env_map.get(source.platform, ""))
         group_user_allowlist = ""
         group_chat_allowlist = ""
         if source.chat_type in {"group", "forum"}:
-            group_user_allowlist = _auth_env(platform_group_user_env_map.get(source.platform, ""))
-            group_chat_allowlist = _auth_env(platform_group_chat_env_map.get(source.platform, ""))
-        global_allowlist = _auth_env("GATEWAY_ALLOWED_USERS")
+            group_user_allowlist = _platform_gate_env(platform_group_user_env_map.get(source.platform, ""))
+            group_chat_allowlist = _platform_gate_env(platform_group_chat_env_map.get(source.platform, ""))
+        global_allowlist = _platform_gate_env("GATEWAY_ALLOWED_USERS")
 
         if not platform_allowlist and not group_user_allowlist and not group_chat_allowlist and not global_allowlist:
             # No env allowlist configured. Adapters that own their own
@@ -688,7 +673,7 @@ class GatewayAuthorizationMixin:
                     if user_id in allowed or "*" in allowed:
                         return True
             # No allowlists configured -- check global allow-all flag
-            return _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
+            return _platform_gate_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
         # Telegram can optionally authorize group traffic by chat ID.
         # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
