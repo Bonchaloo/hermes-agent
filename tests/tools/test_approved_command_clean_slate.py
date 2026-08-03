@@ -234,3 +234,37 @@ def test_execute_code_non_approved_still_interrupts_on_stale_bit(monkeypatch):
     assert "CODE_DONE" not in result["output"], result
 
 
+def test_execute_code_stale_interrupt_prevents_remote_dispatch(monkeypatch):
+    """A stale interrupt must stop non-user-approved remote execution before
+    the backend receives the script, not after remote side effects are possible."""
+    from tools import code_execution_tool as cet
+
+    monkeypatch.setattr(
+        "tools.approval.check_execute_code_guard",
+        lambda *a, **k: {"approved": True},
+    )
+    monkeypatch.setattr(
+        "tools.terminal_tool._get_env_config",
+        lambda: {"env_type": "ssh"},
+    )
+    monkeypatch.setattr(
+        "tools.terminal_tool._docker_has_host_access",
+        lambda config: False,
+    )
+    dispatches = []
+    monkeypatch.setattr(
+        cet,
+        "_execute_remote",
+        lambda *a, **k: dispatches.append((a, k)),
+    )
+    set_interrupt(True)
+
+    result = json.loads(cet.execute_code(
+        code='print("REMOTE_SIDE_EFFECT")',
+        task_id="test-clean-slate-remote",
+    ))
+
+    assert result["status"] == "interrupted", result
+    assert dispatches == []
+
+

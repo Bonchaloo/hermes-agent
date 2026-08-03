@@ -1326,6 +1326,20 @@ def execute_code(
     if _guard.get("user_approved"):
         from tools.interrupt import clear_current_thread_interrupt
         clear_current_thread_interrupt()
+    else:
+        # Honor a pre-existing interrupt before either dispatch path can spawn
+        # the script.  Checking only inside the local ``proc.poll()`` loop is
+        # racy: a fast child (or a descheduled parent) can exit before the first
+        # poll, skipping the loop after it has already produced side effects.
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return json.dumps({
+                "status": "interrupted",
+                "output": "[execution interrupted — user sent a new message]",
+                "exit_code": -1,
+                "tool_calls_made": 0,
+                "duration_seconds": 0,
+            }, ensure_ascii=False)
 
     if env_type != "local":
         return _execute_remote(code, task_id, enabled_tools)
