@@ -389,7 +389,13 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 
 def _git_root(cwd: Path) -> Optional[Path]:
     current = cwd.resolve()
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+    except Exception:
+        temp_root = None
     for parent in [current, *current.parents]:
+        if temp_root is not None and parent == temp_root:
+            continue
         if (parent / ".git").exists():
             return parent
     return None

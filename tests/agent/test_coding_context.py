@@ -96,6 +96,23 @@ class TestWorkspaceBlock:
     def test_empty_outside_repo(self, tmp_path):
         assert cc.build_coding_workspace_block(tmp_path) == ""
 
+    def test_shared_temp_root_git_dir_is_ignored(self, tmp_path, monkeypatch):
+        shared_temp = tmp_path / "shared-temp"
+        project = shared_temp / "project"
+        project.mkdir(parents=True)
+        monkeypatch.setattr(cc.tempfile, "gettempdir", lambda: str(shared_temp))
+
+        real_exists = Path.exists
+
+        def fake_exists(path: Path) -> bool:
+            if path.name == ".git":
+                return path == shared_temp / ".git"
+            return real_exists(path)
+
+        monkeypatch.setattr(Path, "exists", fake_exists)
+
+        assert cc._git_root(project) is None
+
     def test_reports_branch_and_clean_status(self, tmp_path):
         _git_init(tmp_path)
         block = cc.build_coding_workspace_block(tmp_path)
