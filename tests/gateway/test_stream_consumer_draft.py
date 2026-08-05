@@ -106,7 +106,9 @@ class TestDraftStreamingHappyPath:
             transport="auto", chat_type="dm",
             edit_interval=0.01, buffer_threshold=5, cursor="",
         )
-        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer = GatewayStreamConsumer(
+            adapter, "12345", cfg, response_generation="draft-generation"
+        )
 
         consumer.on_delta("Hello ")
         task = asyncio.create_task(consumer.run())
@@ -125,6 +127,10 @@ class TestDraftStreamingHappyPath:
         # All draft frames in this run shared a single draft_id (animation).
         draft_ids = {c["draft_id"] for c in adapter.draft_calls}
         assert len(draft_ids) == 1
+        assert {
+            call["metadata"]["_response_generation"]
+            for call in adapter.draft_calls
+        } == {"draft-generation"}
         # Final answer was delivered as a regular sendMessage so the user
         # sees a real message in their history (drafts have no message_id).
         adapter.send.assert_awaited()
@@ -265,8 +271,15 @@ def _make_fresh_final_adapter():
 
     # Edit-based path only — no native drafts.
     adapter.supports_draft_streaming = lambda chat_type=None, metadata=None: False
-    # Accepts the metadata kwarg the consumer passes; ignores it (like Telegram).
-    adapter.prefers_fresh_final_streaming = lambda content, metadata=None: True
+    # Accepts the metadata kwarg the consumer passes and records it so the
+    # preference probe is covered by the same response-generation contract.
+    adapter.preference_metadata = []
+
+    def _prefers_fresh_final(content, metadata=None):
+        adapter.preference_metadata.append(metadata)
+        return True
+
+    adapter.prefers_fresh_final_streaming = _prefers_fresh_final
 
     adapter.send = AsyncMock(side_effect=[
         SendResult(success=True, message_id="preview1"),
@@ -290,7 +303,9 @@ class TestAdapterPrefersFreshFinal:
             edit_interval=0.01, buffer_threshold=5, cursor="",
             fresh_final_after_seconds=0.0,  # only the adapter hook drives fresh-final
         )
-        consumer = GatewayStreamConsumer(adapter, "12345", cfg)
+        consumer = GatewayStreamConsumer(
+            adapter, "12345", cfg, response_generation="fresh-generation"
+        )
 
         consumer.on_delta("Full answer here")
         task = asyncio.create_task(consumer.run())
@@ -302,6 +317,13 @@ class TestAdapterPrefersFreshFinal:
 
         # Two sends: the streaming preview, then the fresh final.
         assert adapter.send.await_count == 2
+        assert {
+            call.kwargs["metadata"]["_response_generation"]
+            for call in adapter.send.call_args_list
+        } == {"fresh-generation"}
+        assert adapter.preference_metadata[-1]["_response_generation"] == (
+            "fresh-generation"
+        )
         first_content = adapter.send.call_args_list[0].kwargs.get("content")
         second_content = adapter.send.call_args_list[1].kwargs.get("content")
         # First update delivered the preview via adapter.send.

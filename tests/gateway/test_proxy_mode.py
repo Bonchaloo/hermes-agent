@@ -1,5 +1,8 @@
 """Tests for gateway proxy mode — forwarding messages to a remote API server."""
 
+import sys
+import types
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -85,10 +88,10 @@ class _FakeSession:
 
 def _patch_aiohttp(session):
     """Patch aiohttp.ClientSession to return our fake session."""
-    return patch(
-        "aiohttp.ClientSession",
-        return_value=session,
-    )
+    fake_aiohttp = types.ModuleType("aiohttp")
+    fake_aiohttp.ClientSession = MagicMock(return_value=session)
+    fake_aiohttp.ClientTimeout = MagicMock()
+    return patch.dict(sys.modules, {"aiohttp": fake_aiohttp})
 
 
 class TestGetProxyUrl:
@@ -151,6 +154,7 @@ class TestRunAgentProxyDispatch:
 
         runner._run_agent_via_proxy = AsyncMock(return_value=expected_result)
 
+        generation = "9ad13f7d-7602-4ed0-a66c-0c58cbc84fc0"
         result = await runner._run_agent(
             message="hi",
             context_prompt="",
@@ -159,11 +163,17 @@ class TestRunAgentProxyDispatch:
             session_id="test-session-123",
             session_key="test-key",
             run_generation=7,
+            response_generation=generation,
         )
 
         assert result["final_response"] == "Hello from remote!"
+        assert result["response_generation"] == generation
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
+        assert (
+            runner._run_agent_via_proxy.call_args.kwargs["response_generation"]
+            == generation
+        )
 
 
 class TestRunAgentViaProxy:
@@ -241,7 +251,7 @@ class TestRunAgentViaProxy:
                 pass
 
         with patch("gateway.run._load_gateway_config", return_value={}):
-            with patch("aiohttp.ClientSession", return_value=_ErrorSession()):
+            with _patch_aiohttp(_ErrorSession()):
                 with patch("aiohttp.ClientTimeout"):
                     result = await runner._run_agent_via_proxy(
                         message="hi",

@@ -91,6 +91,8 @@ class GatewayAuthorizationMixin:
         """
         if not platform:
             return None
+        if profile is not None and not isinstance(profile, str):
+            return None
         profile_name = (profile or "").strip() or None
         if profile_name and profile_name != "default":
             active_profile = None
@@ -140,28 +142,388 @@ class GatewayAuthorizationMixin:
             getattr(source, "profile", None),
         )
 
-    def _registered_transport_adapter(self, source: SessionSource):
-        """Return the registered adapter that created *source*, if retained.
+    def _candidate_adapter_for_restored_source(
+        self, source: Optional[SessionSource]
+    ):
+        """Select a live adapter candidate before restored provenance exists.
 
-        ``source.profile`` is the runtime/session namespace. A chat-based
-        profile route can therefore differ from the adapter profile when one
-        shared credential serves several routed runtimes. ``build_source``
-        keeps the receiving adapter as in-process provenance so replies and
-        intake-policy checks stay on that transport without weakening the
-        fail-closed fallback for restored or hand-built sources.
+        ``transport_route`` is only a discriminator: the reconstruction gate
+        still verifies exact registration, advertised logical platform,
+        authenticated epoch, profile existence, and current authorization.
         """
-        adapter_ref = getattr(source, "_transport_adapter_ref", None)
-        adapter = adapter_ref() if callable(adapter_ref) else None
-        platform = getattr(source, "platform", None)
-        if adapter is None or platform is None:
+        if source is None:
             return None
-        if adapter is (getattr(self, "adapters", None) or {}).get(platform):
-            return adapter
-        profile_maps = getattr(self, "_profile_adapters", None) or {}
-        for profile_adapters in profile_maps.values():
-            if adapter is profile_adapters.get(platform):
+        if getattr(source, "transport_route", None) == "relay":
+            return (getattr(self, "adapters", None) or {}).get(Platform.RELAY)
+        return self._adapter_for_source(source)
+
+    def _registered_transport_adapter(self, source: SessionSource):
+        """Return the registered adapter that owns this exact immutable source."""
+        platform = getattr(source, "platform", None)
+        candidates = []
+        default_adapter = (getattr(self, "adapters", None) or {}).get(platform)
+        if default_adapter is not None:
+            candidates.append(default_adapter)
+        for profile_adapters in (
+            getattr(self, "_profile_adapters", None) or {}
+        ).values():
+            adapter = profile_adapters.get(platform)
+            if adapter is not None:
+                candidates.append(adapter)
+        for adapter in candidates:
+            registry = getattr(adapter, "_source_provenance", None)
+            if registry is not None and registry.verifies(source):
                 return adapter
         return None
+
+    def _registered_relay_transport_adapter(self, source: SessionSource):
+        """Return the live authenticated relay epoch that received *source*."""
+        candidates = []
+        default_adapter = (getattr(self, "adapters", None) or {}).get(Platform.RELAY)
+        if default_adapter is not None:
+            candidates.append(default_adapter)
+        for profile_adapters in (
+            getattr(self, "_profile_adapters", None) or {}
+        ).values():
+            adapter = profile_adapters.get(Platform.RELAY)
+            if adapter is not None:
+                candidates.append(adapter)
+        for adapter in candidates:
+            transport = getattr(adapter, "_transport", None)
+            epoch = getattr(transport, "authenticated_connection_epoch", None)
+            registry = getattr(transport, "_source_provenance", None)
+            if (
+                epoch
+                and registry is not None
+                and registry.verifies(source, epoch=epoch)
+            ):
+                return adapter
+        return None
+
+    def _discord_transport_authorizes_source(
+        self,
+        source: SessionSource,
+        user_id: str,
+    ) -> bool:
+        """Re-check Discord intake evidence on the selected live transport.
+
+        Discord normalizes configured user entries (for example ``<@123>``
+        and ``user:123``) and can intentionally admit guild traffic using only
+        ``allowed_channels``. The generic env/config checks below cannot safely
+        reconstruct either decision: their values are raw, and process-global
+        env may belong to another multiplex profile. Consult only the adapter
+        selected by the source's retained transport provenance. Profile/platform
+        lookup is intentionally insufficient: restored or hand-built sources
+        must not borrow a live adapter's intake-only grants. A missing or
+        unregistered transport adapter provides no authorization.
+        """
+        adapter = self._registered_transport_adapter(source)
+        if adapter is None:
+            return False
+
+        allowed_users = getattr(adapter, "_allowed_user_ids", None) or set()
+        allowed_roles = getattr(adapter, "_allowed_role_ids", None) or set()
+        if allowed_users:
+            return "*" in allowed_users or user_id in allowed_users
+        if allowed_roles:
+            # Role grants are stamped on SessionSource only after the Discord
+            # adapter verifies membership in the originating guild. That gate
+            # is checked separately before this helper is called.
+            return False
+
+        if source.chat_type not in {"group", "forum", "channel", "thread"}:
+            return False
+        channel_check = getattr(adapter, "_discord_channel_ids_allowed", None)
+        if not callable(channel_check):
+            return False
+        channel_keys = self._discord_source_channel_keys(source, adapter)
+        if not channel_keys:
+            return False
+        try:
+            return bool(channel_check(channel_keys))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _discord_source_channel_keys(source: SessionSource, adapter=None) -> set[str]:
+        """Return Discord channel-policy keys available from a source.
+
+        Native intake accepts channel snowflakes, bare names, ``#name``, and
+        thread-parent forms. Persisted sources retain the channel display name;
+        a live adapter may additionally resolve the current channel object from
+        cache so a thread's parent name participates in the same policy.
+        """
+        keys = {
+            str(value).strip()
+            for value in (source.chat_id, source.thread_id, source.parent_chat_id)
+            if value is not None and str(value).strip()
+        }
+        chat_name = source.chat_name
+        if isinstance(chat_name, str) and chat_name.strip():
+            display_name = chat_name.strip()
+            keys.add(display_name)
+            leaf_name = display_name.rsplit(" / ", 1)[-1].strip()
+            normalized_name = leaf_name.removeprefix("#").strip()
+            if normalized_name:
+                keys.add(normalized_name)
+                keys.add(f"#{normalized_name}")
+
+        client = getattr(adapter, "_client", None)
+        get_channel = getattr(client, "get_channel", None)
+        key_builder = getattr(adapter, "_discord_channel_keys_from_channel", None)
+        if callable(get_channel) and callable(key_builder):
+            channel_id = source.thread_id or source.chat_id
+            try:
+                channel = get_channel(int(channel_id))
+            except (TypeError, ValueError):
+                channel = None
+            if channel is not None:
+                keys.update(key_builder(channel, source.parent_chat_id))
+        return keys
+
+    def _discord_transport_denies_source(
+        self,
+        source: SessionSource,
+        adapter,
+        *,
+        allow_unconfigured_without_adapter: bool = False,
+    ) -> bool:
+        """Apply Discord's channel restrictions before every grant.
+
+        Native Discord ingress always has retained adapter provenance and a
+        channel identity for guild traffic. Missing provenance, malformed guild
+        context, unavailable policy helpers, and policy errors all fail closed.
+        Structurally valid DMs intentionally do not participate in Discord
+        channel policy. Unknown chat types and DM sources carrying guild/thread
+        structure are malformed and fail closed. Authenticated relay ingress has
+        no native Discord transport; in that case scoped environment policy is
+        still enforced, while an unconfigured policy does not erase upstream
+        owner authentication.
+        """
+        if adapter is None and not allow_unconfigured_without_adapter:
+            return True
+        chat_type = source.chat_type
+        server_chat_types = {"group", "forum", "channel", "thread"}
+        if not isinstance(chat_type, str) or chat_type not in server_chat_types | {"dm"}:
+            return True
+        if chat_type == "dm":
+            return bool(
+                source.scope_id
+                or source.guild_id
+                or source.parent_chat_id
+                or source.thread_id
+            )
+        if chat_type not in server_chat_types:
+            return False
+        channel_keys = self._discord_source_channel_keys(source, adapter)
+        if not channel_keys:
+            return True
+        try:
+            if adapter is not None:
+                ignored_check = getattr(adapter, "_discord_channel_ids_ignored", None)
+                allowed_getter = getattr(adapter, "_get_allowed_channels", None)
+                if not callable(ignored_check) or not callable(allowed_getter):
+                    return True
+                if bool(ignored_check(channel_keys)):
+                    return True
+                allowed = allowed_getter()
+            else:
+                ignored = _coerce_allow_set(
+                    _platform_gate_env("DISCORD_IGNORED_CHANNELS")
+                )
+                if "*" in ignored or bool(channel_keys & ignored):
+                    return True
+                allowed = _coerce_allow_set(
+                    _platform_gate_env("DISCORD_ALLOWED_CHANNELS")
+                )
+            return bool(
+                allowed
+                and "*" not in allowed
+                and not (channel_keys & allowed)
+            )
+        except Exception:
+            return True
+
+    def _restored_native_source_for_authorization(
+        self, source: SessionSource, adapter
+    ) -> Optional[SessionSource]:
+        """Rebuild one persisted native source solely for startup recovery."""
+        if getattr(source, "_persisted_metadata_valid", True) is not True:
+            return None
+        if (
+            adapter is None
+            or source.platform == Platform.RELAY
+            or getattr(adapter, "platform", None) != source.platform
+        ):
+            return None
+        valid_chat_types = {"dm", "group", "channel", "thread", "forum"}
+        if not isinstance(source.chat_id, str) or not source.chat_id.strip():
+            return None
+        if not isinstance(source.chat_type, str) or source.chat_type not in valid_chat_types:
+            return None
+        for value in (
+            source.chat_name,
+            source.chat_topic,
+            source.user_id,
+            source.user_name,
+            source.thread_id,
+            source.parent_chat_id,
+            source.message_id,
+            source.scope_id,
+        ):
+            if value is not None and not isinstance(value, str):
+                return None
+
+        profile = source.profile
+        if profile is not None:
+            if not isinstance(profile, str) or not profile.strip():
+                return None
+            if not bool(
+                getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            ):
+                return None
+            try:
+                from hermes_cli.profiles import profile_exists
+
+                if not profile_exists(profile):
+                    return None
+            except Exception:
+                return None
+        build_source = getattr(adapter, "build_source", None)
+        if not callable(build_source):
+            return None
+        try:
+            rebuilt = build_source(
+                chat_id=source.chat_id,
+                chat_name=source.chat_name,
+                chat_type=source.chat_type,
+                user_id=source.user_id,
+                user_name=source.user_name,
+                thread_id=source.thread_id,
+                chat_topic=source.chat_topic,
+                user_id_alt=source.user_id_alt,
+                chat_id_alt=source.chat_id_alt,
+                is_bot=source.is_bot,
+                scope_id=source.scope_id,
+                guild_id=source.guild_id,
+                parent_chat_id=source.parent_chat_id,
+                message_id=source.message_id,
+                # Role membership is adapter-local evidence for one live event.
+                # Never promote a persisted boolean into fresh transport trust;
+                # role-only sessions must be reauthorized by a new live event.
+                role_authorized=False,
+                auto_thread_created=source.auto_thread_created,
+                auto_thread_initial_name=source.auto_thread_initial_name,
+                _profile_override=source.profile,
+            )
+        except Exception:
+            from gateway.run import logger
+
+            logger.warning(
+                "Skipping malformed restored %s source during authorization: ***",
+                source.platform.value,
+            )
+            return None
+        if not isinstance(rebuilt, SessionSource):
+            return None
+        return rebuilt
+
+    def _restored_source_for_authorization(
+        self, source: SessionSource, adapter
+    ) -> Optional[SessionSource]:
+        """Rebuild one persisted source against a current process adapter.
+
+        Relay persistence carries only the non-authoritative ``transport_route``
+        discriminator.  Startup may promote that descriptor into a live relay
+        source only after binding it to the one current process RelayAdapter,
+        validating its exact underlying Discord platform/profile, and registering
+        the rebuilt object in the current authenticated connection epoch.
+        """
+        if getattr(source, "transport_route", None) != "relay":
+            return self._restored_native_source_for_authorization(source, adapter)
+
+        if getattr(source, "_persisted_metadata_valid", True) is not True:
+            return None
+        if source.platform != Platform.DISCORD:
+            return None
+        if adapter is not (getattr(self, "adapters", None) or {}).get(Platform.RELAY):
+            return None
+        if getattr(adapter, "platform", None) != Platform.RELAY:
+            return None
+        fronts_platform = getattr(adapter, "fronts_platform", None)
+        if not callable(fronts_platform) or not fronts_platform(source.platform):
+            return None
+
+        valid_chat_types = {"dm", "group", "channel", "thread", "forum"}
+        if not isinstance(source.chat_id, str) or not source.chat_id.strip():
+            return None
+        if not isinstance(source.chat_type, str) or source.chat_type not in valid_chat_types:
+            return None
+        for value in (
+            source.chat_name,
+            source.chat_topic,
+            source.user_id,
+            source.user_name,
+            source.thread_id,
+            source.parent_chat_id,
+            source.message_id,
+            source.scope_id,
+        ):
+            if value is not None and not isinstance(value, str):
+                return None
+
+        profile = source.profile
+        if profile is not None:
+            if not isinstance(profile, str) or not profile.strip():
+                return None
+            if not bool(getattr(getattr(self, "config", None), "multiplex_profiles", False)):
+                return None
+            try:
+                from hermes_cli.profiles import profile_exists
+
+                if not profile_exists(profile):
+                    return None
+            except Exception:
+                return None
+
+        transport = getattr(adapter, "_transport", None)
+        epoch = getattr(transport, "authenticated_connection_epoch", None)
+        registry = getattr(transport, "_source_provenance", None)
+        if not epoch or registry is None:
+            return None
+
+        rebuilt = SessionSource(
+            platform=source.platform,
+            chat_id=source.chat_id,
+            chat_name=source.chat_name,
+            chat_type=source.chat_type,
+            user_id=source.user_id,
+            user_name=source.user_name,
+            thread_id=source.thread_id,
+            chat_topic=source.chat_topic,
+            user_id_alt=source.user_id_alt,
+            chat_id_alt=source.chat_id_alt,
+            is_bot=source.is_bot,
+            scope_id=source.scope_id,
+            parent_chat_id=source.parent_chat_id,
+            message_id=source.message_id,
+            role_authorized=False,
+            profile=profile,
+            transport_route="relay",
+            auto_thread_created=source.auto_thread_created,
+            auto_thread_initial_name=source.auto_thread_initial_name,
+            prospective_thread_id=source.prospective_thread_id,
+            delivered_via_upstream_relay=True,
+        )
+        registry.register(rebuilt, epoch=epoch)
+
+        # Rehydrate only delivery discriminators.  Authorization below is always
+        # recomputed from the current profile-scoped Discord policy; no persisted
+        # role grant or prior-process provenance survives this boundary.
+        capture_scope = getattr(adapter, "_capture_scope", None)
+        if callable(capture_scope):
+            capture_scope(type("RestoredRelayEvent", (), {"source": rebuilt})())
+        return rebuilt
 
     def _adapter_profile_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the transport-owning profile for adapter policy lookups."""
@@ -370,6 +732,49 @@ class GatewayAuthorizationMixin:
         return getattr(self, "pairing_store", None)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
+        """Authorize under the source profile's exact runtime secret scope."""
+        profile = getattr(source, "profile", None)
+        if profile is not None and (
+            not isinstance(profile, str) or not profile.strip()
+        ):
+            return False
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            multiplex_active = is_multiplex_active()
+        except Exception:
+            multiplex_active = False
+
+        relay_delivery = (
+            getattr(source, "delivered_via_upstream_relay", False) is True
+        )
+        if profile is not None:
+            try:
+                from hermes_cli.profiles import profile_exists
+
+                if not profile_exists(profile):
+                    return False
+            except Exception:
+                return False
+
+        if multiplex_active and relay_delivery:
+            try:
+                from gateway.run import _profile_runtime_scope
+
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    return self._is_user_authorized_in_scope(source)
+            except Exception:
+                from gateway.run import logger
+
+                logger.warning(
+                    "Authorization denied: could not install profile scope",
+                    exc_info=True,
+                )
+                return False
+        return self._is_user_authorized_in_scope(source)
+
+    def _is_user_authorized_in_scope(self, source: SessionSource) -> bool:
         """
         Check if a user is authorized to use the bot.
         
@@ -414,15 +819,66 @@ class GatewayAuthorizationMixin:
         # user ("Unauthorized user <id> on discord"). The adapter-flag check is
         # retained for events whose ``source.platform`` IS ``Platform.RELAY``
         # (e.g. the interaction-passthrough path).
-        # ``is True`` (not just truthiness): the marker is a real bool on a
-        # SessionSource, and an explicit identity check refuses to authorize a
-        # non-bool stand-in (e.g. a MagicMock attribute auto-vivifies truthy in
-        # tests) — defensive against accidental fail-open.
-        if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
+        # The public marker supports routing, but authorization additionally
+        # requires the exact live relay transport attached at authenticated
+        # wire reconstruction and owned by a registered RelayAdapter.
+        # Constructor-set, persisted, or copied markers therefore cannot
+        # manufacture upstream trust.
+        if source.delivered_via_upstream_relay is True:
+            relay_adapter = self._registered_relay_transport_adapter(source)
+            if (
+                relay_adapter is None
+                or getattr(relay_adapter, "authorization_is_upstream", False)
+                is not True
+            ):
+                return False
+            if source.platform == Platform.DISCORD:
+                discord_policy_adapter = self._authorization_adapter(
+                    Platform.DISCORD,
+                    profile=adapter_profile,
+                )
+                if self._discord_transport_denies_source(
+                    source,
+                    discord_policy_adapter,
+                    allow_unconfigured_without_adapter=True,
+                ):
+                    return False
+            return True
+
+        # Relay sources are accepted only through the authenticated transport
+        # branch above. A caller-built Platform.RELAY source has no provenance.
+        if source.platform == Platform.RELAY:
+            return False
+
+        if self._adapter_authorization_is_upstream(
             source.platform,
             profile=adapter_profile,
         ):
-            return True
+            if source.platform != Platform.DISCORD:
+                return True
+            upstream_transport = self._registered_transport_adapter(source)
+            if upstream_transport is not None and bool(
+                getattr(upstream_transport, "authorization_is_upstream", False)
+            ):
+                if self._discord_transport_denies_source(
+                    source,
+                    upstream_transport,
+                ):
+                    return False
+                return True
+            return False
+
+        # Every native Discord grant depends on evidence owned by the receiving
+        # adapter. Require the exact retained, still-registered transport before
+        # evaluating any grant, then apply ignored-channel policy as a universal
+        # deny before bot, allow-all, role, pairing, user, channel, or global
+        # allowlist paths can return True. Relay-delivered Discord events were
+        # handled by the authenticated-upstream branch above.
+        discord_adapter = None
+        if source.platform == Platform.DISCORD:
+            discord_adapter = self._registered_transport_adapter(source)
+            if self._discord_transport_denies_source(source, discord_adapter):
+                return False
 
         user_id = source.user_id
 
@@ -560,10 +1016,10 @@ class GatewayAuthorizationMixin:
         # the live adapter's PlatformConfig.extra. Under multiplexing it
         # intentionally does not bridge those values into process-global env,
         # so consult only the profile-bound adapter selected by this source.
-        # _adapter_for_source() fails closed for a missing secondary registry
-        # and never falls back to another profile's Discord adapter.
+        # ``discord_adapter`` was bound to retained transport provenance above;
+        # profile/platform lookup is not authorization evidence.
         if source.platform == Platform.DISCORD:
-            adapter = self._adapter_for_source(source)
+            adapter = discord_adapter
             extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
             if str(extra.get("allow_all_users", "")).strip().lower() in {
                 "true",
@@ -572,13 +1028,19 @@ class GatewayAuthorizationMixin:
             }:
                 return True
 
-        # Adapter-verified role auth: the Discord adapter already confirmed the
-        # user holds a role in DISCORD_ALLOWED_ROLES before dispatching the message.
-        # Compare with ``is True`` so the real bool field authorizes while a
-        # MagicMock source (test fixtures using ``object.__new__`` runners with
-        # mock sources) does not auto-truthy through this gate (see pitfall #13).
+        # Adapter-verified role auth: Discord stamps this only after confirming
+        # the role at intake. Bind that in-process stamp to the exact registered
+        # transport that created the source so a hand-built SessionSource cannot
+        # forge the boolean. Other platforms retain their historical bool gate.
+        # Compare with ``is True`` so MagicMock test sources do not auto-truthy.
         if getattr(source, "role_authorized", False) is True:
-            return True
+            if source.platform != Platform.DISCORD:
+                return True
+            role_adapter = self._registered_transport_adapter(source)
+            if role_adapter is not None and bool(
+                getattr(role_adapter, "_allowed_role_ids", None)
+            ):
+                return True
 
         # Check pairing store. A pairing entry is a first-class authorization
         # grant, created only by a trusted operator approving a pairing code
@@ -597,6 +1059,16 @@ class GatewayAuthorizationMixin:
         platform_name = source.platform.value if source.platform else ""
         pairing_store = self._pairing_store_for(source)
         if pairing_store is not None and pairing_store.is_approved(platform_name, user_id):
+            return True
+
+        # Discord's adapter owns two pieces of authorization evidence that the
+        # generic gate cannot derive safely: normalized allow_from principals
+        # and channel-only guild grants. Re-check both against the exact live,
+        # registered transport selected for this source.
+        if source.platform == Platform.DISCORD and self._discord_transport_authorizes_source(
+            source,
+            user_id,
+        ):
             return True
 
         # Check platform-specific and global allowlists
@@ -678,7 +1150,11 @@ class GatewayAuthorizationMixin:
             # group_allow_from at intake but do not override enforces_own_access_policy.
             # Check their allowlist here so config.yaml-configured allow_from works
             # without requiring a separate {PLATFORM}_ALLOWED_USERS env var.
-            adapter = self._adapter_for_source(source)
+            adapter = (
+                discord_adapter
+                if source.platform == Platform.DISCORD
+                else self._adapter_for_source(source)
+            )
             if adapter is not None:
                 extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
                 if source.chat_type in {"group", "forum", "channel"}:

@@ -17,7 +17,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.config import PlatformConfig
 from gateway.session import Platform, SessionSource
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 @pytest.fixture(autouse=True)
@@ -55,12 +57,16 @@ def _make_bare_runner():
     # any allowlist check succeeds; stub it to never approve so we exercise
     # the real allowlist path.
     runner.pairing_store = SimpleNamespace(is_approved=lambda *_a, **_kw: False)
-    return runner
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: None
+    adapter.gateway_runner = runner
+    return runner, adapter
 
 
-def _make_discord_bot_source(bot_id: str = "999888777"):
-    return SessionSource(
-        platform=Platform.DISCORD,
+def _make_discord_bot_source(adapter, bot_id: str = "999888777"):
+    return adapter.build_source(
         chat_id="123",
         chat_type="channel",
         user_id=bot_id,
@@ -69,9 +75,8 @@ def _make_discord_bot_source(bot_id: str = "999888777"):
     )
 
 
-def _make_discord_human_source(user_id: str = "100200300"):
-    return SessionSource(
-        platform=Platform.DISCORD,
+def _make_discord_human_source(adapter, user_id: str = "100200300"):
+    return adapter.build_source(
         chat_id="123",
         chat_type="channel",
         user_id=user_id,
@@ -89,12 +94,12 @@ def test_discord_bot_authorized_when_allow_bots_mentions(monkeypatch):
     the webhook's bot ID is not (and shouldn't be) on the human
     allowlist.
     """
-    runner = _make_bare_runner()
+    runner, adapter = _make_bare_runner()
 
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "mentions")
     monkeypatch.setenv("DISCORD_ALLOWED_USERS", "100200300")  # human-only allowlist
 
-    source = _make_discord_bot_source(bot_id="999888777")
+    source = _make_discord_bot_source(adapter, bot_id="999888777")
     assert runner._is_user_authorized(source) is True
 
 
@@ -102,7 +107,7 @@ def test_bot_bypass_does_not_leak_to_other_platforms(monkeypatch):
     """The is_bot bypass is Discord-specific — a Telegram bot source with
     is_bot=True must NOT be authorized just because DISCORD_ALLOW_BOTS=all.
     """
-    runner = _make_bare_runner()
+    runner, _adapter = _make_bare_runner()
 
     monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "100200300")
@@ -135,13 +140,13 @@ def test_discord_role_config_does_not_bypass_gateway_allowlist(monkeypatch):
     adapter pre-filter on real message events; the gateway layer requires
     an explicit allowlist hit or pairing approval.
     """
-    runner = _make_bare_runner()
+    runner, adapter = _make_bare_runner()
 
     monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "1493705176387948674")
     # DISCORD_ALLOWED_USERS deliberately NOT set — verifies the role
     # config alone no longer grants authorization.
 
-    source = _make_discord_human_source(user_id="999888777")
+    source = _make_discord_human_source(adapter, user_id="999888777")
     assert runner._is_user_authorized(source) is False
 
 
@@ -150,7 +155,7 @@ def test_discord_role_config_does_not_leak_to_other_platforms(monkeypatch):
     not suddenly start authorizing Telegram users whose platform has its
     own empty allowlist.
     """
-    runner = _make_bare_runner()
+    runner, _adapter = _make_bare_runner()
 
     monkeypatch.setenv("DISCORD_ALLOWED_ROLES", "1493705176387948674")
     # Telegram has its own empty allowlist and no allow-all flag.

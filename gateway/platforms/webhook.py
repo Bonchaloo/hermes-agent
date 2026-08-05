@@ -894,9 +894,8 @@ class WebhookAdapter(BasePlatformAdapter):
             chat_type="webhook",
             user_id=f"webhook:{route_name}",
             user_name=route_name,
+            _profile_override=profile if isinstance(profile, str) else None,
         )
-        if profile and isinstance(profile, str):
-            source.profile = profile
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,

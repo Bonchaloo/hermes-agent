@@ -36,10 +36,12 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.session import SessionSource
+from gateway.session import SessionSource, _validated_scope_aliases
 from gateway.relay.descriptor import CapabilityDescriptor
 from gateway.relay.transport import InboundHandler
+from gateway.source_provenance import SourceProvenanceRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -165,21 +167,112 @@ def _normalize_slack_parent_command(
     return normalized, normalized_type
 
 
-def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
+def _relay_source_metadata_is_valid(src: Any) -> bool:
+    """Validate authorization-relevant relay source fields before trust."""
+    if not isinstance(src, dict):
+        return False
+    platform = src.get("platform")
+    if not isinstance(platform, str):
+        return False
+    try:
+        platform_enum = Platform(platform)
+    except ValueError:
+        return False
+    chat_type = src.get("chat_type")
+    if (
+        "chat_type" not in src
+        or not isinstance(chat_type, str)
+        or not chat_type.strip()
+    ):
+        return False
+    if (
+        platform_enum == Platform.DISCORD
+        and chat_type not in {"dm", "group", "channel", "thread", "forum"}
+    ):
+        return False
+    for key in ("chat_id", "user_id"):
+        value = src.get(key)
+        if value is not None and not isinstance(value, str):
+            return False
+    try:
+        _validated_scope_aliases(src)
+    except ValueError:
+        return False
+    for key in (
+        "chat_name",
+        "user_name",
+        "user_display_name",
+        "user_handle",
+        "thread_id",
+        "chat_topic",
+        "user_id_alt",
+        "chat_id_alt",
+        "scope_id",
+        "parent_chat_id",
+        "message_id",
+        "profile",
+        "auto_thread_initial_name",
+        "prospective_thread_id",
+    ):
+        value = src.get(key)
+        if value is not None and not isinstance(value, str):
+            return False
+    profile = src.get("profile")
+    if isinstance(profile, str) and not profile.strip():
+        return False
+    for key in ("auto_thread_created",):
+        if key in src and not isinstance(src.get(key), bool):
+            return False
+    return True
+
+
+def _event_from_wire(
+    raw: Dict[str, Any],
+    *,
+    transport: Any = None,
+) -> MessageEvent:
     """Rebuild a MessageEvent from the connector's normalized inbound payload.
 
     The connector emits SessionSource as the snake_case wire form (§3); map it
     back onto the gateway dataclasses. Unknown message types fall back to TEXT.
     """
-    src = raw.get("source", {}) or {}
-    from gateway.config import Platform
-
+    if not isinstance(raw, dict):
+        raise ValueError("relay event must be an object")
+    src = raw.get("source")
+    if not _relay_source_metadata_is_valid(src):
+        raise ValueError("relay source metadata is malformed")
+    assert isinstance(src, dict)
+    if "metadata" in raw and not isinstance(raw.get("metadata"), dict):
+        raise ValueError("relay event metadata must be an object")
+    reply_to = raw.get("reply_to")
+    if reply_to is not None and not isinstance(reply_to, dict):
+        raise ValueError("relay reply_to must be an object")
+    if isinstance(reply_to, dict):
+        for key in ("text", "author"):
+            if reply_to.get(key) is not None and not isinstance(reply_to[key], str):
+                raise ValueError(f"relay reply_to.{key} must be a string")
+        if "is_own" in reply_to and not isinstance(reply_to.get("is_own"), bool):
+            raise ValueError("relay reply_to.is_own must be a boolean")
+    message_type_value = raw.get("message_type", "text")
+    if not isinstance(message_type_value, str):
+        raise ValueError("relay message_type must be a string")
+    if not isinstance(raw.get("text", ""), str):
+        raise ValueError("relay text must be a string")
+    for key in ("message_id", "reply_to_message_id"):
+        if raw.get(key) is not None and not isinstance(raw[key], str):
+            raise ValueError(f"relay {key} must be a string")
+    media_urls = raw.get("media_urls") or []
+    if not isinstance(media_urls, list) or not all(
+        isinstance(item, str) for item in media_urls
+    ):
+        raise ValueError("relay media_urls must be a list of strings")
     platform = src.get("platform", "relay")
     try:
         platform_enum = Platform(platform)
     except ValueError:
         platform_enum = Platform.RELAY
 
+    scope_id = _validated_scope_aliases(src)
     source = SessionSource(
         platform=platform_enum,
         chat_id=src.get("chat_id", ""),
@@ -201,7 +294,7 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         chat_topic=src.get("chat_topic"),
         user_id_alt=src.get("user_id_alt"),
         chat_id_alt=src.get("chat_id_alt"),
-        scope_id=src.get("scope_id"),
+        scope_id=scope_id,
         parent_chat_id=src.get("parent_chat_id"),
         message_id=src.get("message_id"),
         # The HERMES profile this event is routed to (multiplex mode). The
@@ -225,17 +318,17 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         # and its later in-thread follow-ups to ONE session. See
         # build_session_key / SessionSource.prospective_thread_id.
         prospective_thread_id=src.get("prospective_thread_id"),
-        # Authentic upstream-trust signal: this event arrived over the
-        # per-instance-authenticated relay WS, so the connector already resolved
-        # it to this instance's owner-bound author. ``platform`` is the
-        # UNDERLYING platform (e.g. discord), not ``relay`` — authz keys the
-        # upstream-trust decision off THIS flag, not off ``platform`` (which
-        # would miss because the relay adapter is registered under
-        # ``Platform.RELAY``). Stamped here, never read off the wire.
-        delivered_via_upstream_relay=True,
     )
+    # Public routing discriminator only. Live authorization is registered by
+    # _handle_frame against the current authenticated connection epoch.
+    source.delivered_via_upstream_relay = True
+    source.transport_route = "relay"
+    epoch = getattr(transport, "authenticated_connection_epoch", None)
+    registry = getattr(transport, "_source_provenance", None)
+    if epoch and registry is not None:
+        registry.register(source, epoch=epoch)
     try:
-        msg_type = MessageType(raw.get("message_type", "text"))
+        msg_type = MessageType(message_type_value)
     except ValueError:
         msg_type = MessageType.TEXT
 
@@ -258,10 +351,10 @@ def _event_from_wire(raw: Dict[str, Any]) -> MessageEvent:
         # Telegram reply_to_message, WhatsApp context + text cache). Maps to
         # the SAME MessageEvent fields native adapters populate, so run.py's
         # reply-context injection works identically over the relay.
-        reply_to_text=(raw.get("reply_to") or {}).get("text"),
-        reply_to_author_name=(raw.get("reply_to") or {}).get("author"),
-        reply_to_is_own_message=bool((raw.get("reply_to") or {}).get("is_own", False)),
-        media_urls=raw.get("media_urls") or [],
+        reply_to_text=(reply_to or {}).get("text"),
+        reply_to_author_name=(reply_to or {}).get("author"),
+        reply_to_is_own_message=bool((reply_to or {}).get("is_own", False)),
+        media_urls=media_urls,
         # Surrounding channel/group CONTEXT the connector attached for this
         # addressed turn (design relay-channel-context): a read-only, oldest→
         # newest list of nearby non-addressed messages (Model A pull / Model B
@@ -432,6 +525,8 @@ class WebSocketRelayTransport:
         # not-yet-provisioned race, not a revocation.
         self._handshake_succeeded = False
         self._auth_revoked = False
+        self._authenticated_connection_epoch: Optional[str] = None
+        self._source_provenance = SourceProvenanceRegistry()
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def connect(self) -> bool:
@@ -441,6 +536,7 @@ class WebSocketRelayTransport:
     async def _dial_and_start(self) -> None:
         """Open the socket, start the reader, send hello. Used by connect() and
         by the reconnect supervisor on a re-dial."""
+        self._invalidate_authenticated_epoch()
         loop = asyncio.get_running_loop()
         self._descriptor_ready = loop.create_future()
         # A fresh handshake is coming; clear any stale descriptor so handshake()
@@ -497,6 +593,7 @@ class WebSocketRelayTransport:
         return {"Authorization": f"Bearer {token}"}
 
     async def disconnect(self) -> None:
+        self._invalidate_authenticated_epoch()
         self._closing = True
         if self._supervisor is not None:
             self._supervisor.cancel()
@@ -552,6 +649,15 @@ class WebSocketRelayTransport:
         operator opted this instance out of the relay). Terminal: the transport
         stops reconnecting, and the adapter surfaces a clean "disabled" state."""
         return self._auth_revoked
+
+    @property
+    def authenticated_connection_epoch(self) -> Optional[str]:
+        """Current descriptor-authenticated socket generation, if any."""
+        return self._authenticated_connection_epoch
+
+    def _invalidate_authenticated_epoch(self) -> None:
+        self._authenticated_connection_epoch = None
+        self._source_provenance.clear()
 
     def set_inbound_handler(self, handler: InboundHandler) -> None:
         self._inbound = handler
@@ -729,7 +835,12 @@ class WebSocketRelayTransport:
                 *lines, buf = buf.split("\n")
                 for line in lines:
                     if line.strip():
-                        await self._handle_frame(line)
+                        try:
+                            await self._handle_frame(line)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 - isolate one bad event
+                            logger.warning("relay: dropping malformed frame: %s", exc)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - log + let the task end; reconnection handled below
@@ -747,6 +858,8 @@ class WebSocketRelayTransport:
                     )
             elif not self._closing:
                 logger.warning("relay ws read loop ended: %s", exc)
+        finally:
+            self._invalidate_authenticated_epoch()
         # Phase 5 §5.3: the socket closed. If reconnect is enabled and this was
         # NOT a deliberate disconnect(), kick the reconnect supervisor so the
         # gateway re-dials + re-handshakes (which triggers the connector's
@@ -817,6 +930,8 @@ class WebSocketRelayTransport:
         except json.JSONDecodeError:
             logger.warning("relay: skipping malformed frame")
             return
+        if not isinstance(frame, dict):
+            raise ValueError("relay frame must be an object")
         ftype = frame.get("type")
         if ftype == "descriptor":
             descriptor = CapabilityDescriptor.from_json(json.dumps(frame.get("descriptor", {})))
@@ -838,11 +953,20 @@ class WebSocketRelayTransport:
             # at least once, so a LATER 4401 close is read as a revocation
             # (opt-out), not a cold-start race.
             self._handshake_succeeded = True
+            if (
+                self._authenticated_connection_epoch is None
+                and self._gateway_id
+                and self._upgrade_secret
+            ):
+                self._authenticated_connection_epoch = uuid.uuid4().hex
             if self._descriptor_ready is not None and not self._descriptor_ready.done():
                 self._descriptor_ready.set_result(descriptor)
         elif ftype == "inbound":
             if self._inbound is not None:
-                event = _event_from_wire(frame.get("event", {}))
+                event = _event_from_wire(frame.get("event", {}), transport=self)
+                epoch = self._authenticated_connection_epoch
+                if epoch is not None:
+                    self._source_provenance.register(event.source, epoch=epoch)
                 await self._inbound(event)
                 # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
                 # a bufferId; ack it after the handler has durably taken it so the

@@ -16,6 +16,8 @@ The correct order is:
 import hashlib
 import hmac
 import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from aiohttp import web
@@ -139,4 +141,55 @@ class TestSignatureBeforeRateLimit:
         # The valid event should have been captured
         assert len(captured_events) == 1
 
+    @pytest.mark.asyncio
+    async def test_profile_webhook_source_keeps_registered_immutable_provenance(self):
+        secret = "test-secret-key"
+        route_name = "profile-route"
+        adapter = _make_adapter(
+            {
+                route_name: {
+                    "secret": secret,
+                    "events": ["push"],
+                    "prompt": "Event: {event}",
+                    "deliver": "log",
+                    "profile": "coder",
+                }
+            }
+        )
+        adapter.gateway_runner = SimpleNamespace(
+            config=SimpleNamespace(multiplex_profiles=True)
+        )
+        captured_events = []
 
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        app = web.Application()
+        app.router.add_post(
+            "/p/{profile}/webhooks/{route_name}",
+            adapter._handle_webhook,
+        )
+        body = json.dumps(SIMPLE_PAYLOAD).encode()
+
+        with patch(
+            "hermes_cli.profiles.profiles_to_serve",
+            return_value=[("default", None), ("coder", None)],
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    f"/p/coder/webhooks/{route_name}",
+                    data=body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-GitHub-Event": "push",
+                        "X-Hub-Signature-256": _github_signature(body, secret),
+                        "X-GitHub-Delivery": "profile-good-001",
+                    },
+                )
+                assert response.status == 202
+
+        assert len(captured_events) == 1
+        source = captured_events[0].source
+        assert source.profile == "coder"
+        assert adapter._source_provenance.verifies(source) is True

@@ -9,6 +9,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
 from gateway.run import GatewayRunner
 
 
@@ -74,26 +75,67 @@ class TestCredentialFingerprint:
 
 class TestProfileMessageHandler:
     @pytest.mark.asyncio
-    async def test_stamps_profile_on_unstamped_source(self):
+    async def test_secondary_source_is_profiled_before_provenance_registration(self):
         runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.session_store = object()
+        runner._handle_active_session_busy_message = object()
+        runner._handle_reaction_event = object()
+        runner._recover_telegram_topic_thread_id = object()
+        runner._busy_text_mode = "queue"
+        runner._make_adapter_auth_check = lambda *_args, **_kwargs: object()
         seen = {}
 
         async def _fake_handle(event):
-            seen["profile"] = event.source.profile
+            seen["source"] = event.source
             return "ok"
 
         runner._handle_message = _fake_handle
-        handler = runner._make_profile_message_handler("coder")
 
-        class _Src:
-            profile = None
+        class _ProfileSourceAdapter:
+            platform = Platform.TELEGRAM
 
-        class _Evt:
-            source = _Src()
+            def __init__(self):
+                self.gateway_runner = runner
 
-        result = await handler(_Evt())
+            def set_message_handler(self, handler):
+                self.message_handler = handler
+
+            def set_fatal_error_handler(self, handler):
+                self.fatal_error_handler = handler
+
+            def set_session_store(self, store):
+                self.session_store = store
+
+            def set_busy_session_handler(self, handler):
+                self.busy_handler = handler
+
+            def set_topic_recovery_fn(self, handler):
+                self.topic_recovery = handler
+
+            def set_authorization_check(self, handler):
+                self.authorization_check = handler
+
+        adapter = _ProfileSourceAdapter()
+        runner._configure_profile_adapter(adapter, "coder", Platform.TELEGRAM)
+        source = BasePlatformAdapter.build_source(
+            adapter,
+            chat_id="secondary-chat",
+            chat_type="group",
+            user_id="42",
+        )
+        event = MessageEvent(
+            text="secondary event",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
+
+        result = await adapter.message_handler(event)
+
         assert result == "ok"
-        assert seen["profile"] == "coder"
+        assert seen["source"] is source
+        assert source.profile == "coder"
+        assert adapter._source_provenance.verifies(source) is True
 
 
 class _SecondaryRecoveryAdapter:
@@ -139,7 +181,9 @@ def _secondary_recovery_runner(*, running=True):
     runner._handle_active_session_busy_message = object()
     runner._recover_telegram_topic_thread_id = object()
     runner._busy_text_mode = "queue"
-    runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+    runner._make_adapter_auth_check = (
+        lambda platform, profile_name=None, adapter=None: object()
+    )
     runner._adapter_disconnect_timeout_secs = lambda: 0
     runner._sync_voice_mode_state_to_adapter = lambda adapter: None
     return runner

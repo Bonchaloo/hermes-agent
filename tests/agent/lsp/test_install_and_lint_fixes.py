@@ -169,8 +169,11 @@ def test_check_lint_returns_error_for_real_ts_type_errors(tmp_path):
         result.stdout = real_tsc_error
         return result
 
+    # This test owns the direct tsc branch. A host-installed LSP must not
+    # short-circuit it before the simulated compiler result is evaluated.
     with patch.object(fops, "_exec", side_effect=fake_exec), \
-         patch.object(fops, "_has_command", return_value=True):
+         patch.object(fops, "_has_command", return_value=True), \
+         patch.object(fops, "_lsp_will_handle", return_value=False):
         lint = fops._check_lint(str(ts_file))
 
     assert lint.skipped is False

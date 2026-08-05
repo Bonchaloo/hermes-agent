@@ -72,11 +72,14 @@ class RelayAdapter(BasePlatformAdapter):
         # recipient's author binding; we re-attach this user_id as
         # metadata.user_id on the outbound action so it can. See _capture_scope.
         self._dm_user_by_chat: Dict[str, str] = {}
-        # (chat_id, triggering_message_id) -> (thread_id, initial_name) of the
+        # (chat_id, triggering_message_id, response_generation) ->
+        # (thread_id, initial_name) of the
         # auto-thread the CONNECTOR created for that exact reply. The message
         # correlation prevents a later title turn in the same parent channel
-        # from consuming stale feedback. Reads pop entries exactly once.
-        self._auto_thread_by_chat: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        # from consuming stale feedback. Values are
+        # Response generation is part of the key so overlapping responses for
+        # one trigger cannot overwrite or consume each other's feedback.
+        self._auto_thread_by_chat: Dict[Tuple[str, str, str], Tuple[str, str]] = {}
         # chat_id -> chat_type (e.g. "dm", "channel", "group") learned from the
         # inbound event. Used to reproduce native Slack's synthetic-DM-thread
         # suppression on the relay lane: a DM streaming reply carries
@@ -319,7 +322,7 @@ class RelayAdapter(BasePlatformAdapter):
     async def _on_inbound(self, event) -> None:
         """Bridge a connector-delivered MessageEvent into the normal adapter path."""
         self._capture_scope(event)
-        self._stamp_slack_session_thread(event)
+        self._stamp_registered_slack_session_thread(event)
         # Phase 3: a structured prompt answer resolves its waiting primitive
         # (approval/confirm/clarify) and is CONSUMED — it must not also
         # dispatch as a chat message. Unknown/expired prompt ids fall through
@@ -394,6 +397,58 @@ class RelayAdapter(BasePlatformAdapter):
             )
         except Exception:  # noqa: BLE001 - config shape is operator-owned
             return True
+
+    def _stamp_registered_slack_session_thread(self, event) -> None:
+        """Stamp and re-seal only this transport's currently verified source.
+
+        The authenticated WebSocket transport registers the complete source
+        before dispatching here.  Slack's native-parity top-level DM stamp is
+        the one intentional post-registration normalization.  It may update
+        that capability only when the exact object verifies immediately before
+        mutation against this adapter's exact live registry and epoch.  A
+        caller-built, copied, stale, already-mutated, wrong-adapter, or
+        foreign-transport source is still stamped for session behavior but is
+        never registered.
+        """
+        source = getattr(event, "source", None)
+        transport = self._transport
+        epoch = getattr(transport, "authenticated_connection_epoch", None)
+        registry = getattr(transport, "_source_provenance", None)
+        inbound_handler = getattr(transport, "_inbound", None)
+        expected_handler = self._on_inbound
+        expected_handler_func = getattr(expected_handler, "__func__", None)
+        owns_inbound_handler = (
+            getattr(inbound_handler, "__self__", None) is self
+            and getattr(inbound_handler, "__func__", None)
+            is expected_handler_func
+        )
+        before_thread_id = getattr(source, "thread_id", None)
+        verified_before = bool(
+            source is not None
+            and epoch
+            and registry is not None
+            and owns_inbound_handler
+            and registry.verifies(source, epoch=epoch)
+        )
+
+        # Keep verification immediately adjacent to the trusted deterministic
+        # mutation: there is no await or callback between the two operations.
+        self._stamp_slack_session_thread(event)
+
+        if (
+            not verified_before
+            or registry is None
+            or getattr(source, "thread_id", None) == before_thread_id
+            or self._transport is not transport
+            or getattr(transport, "authenticated_connection_epoch", None) != epoch
+            or getattr(transport, "_source_provenance", None) is not registry
+            or getattr(getattr(transport, "_inbound", None), "__self__", None)
+            is not self
+            or getattr(getattr(transport, "_inbound", None), "__func__", None)
+            is not expected_handler_func
+        ):
+            return
+        registry.register(source, epoch=epoch)
 
     def _stamp_slack_session_thread(self, event) -> None:
         """Native session-keying parity for fronted Slack DMs.
@@ -550,6 +605,33 @@ class RelayAdapter(BasePlatformAdapter):
         except Exception:  # noqa: BLE001 - scope tracking must never break inbound
             pass
 
+    @staticmethod
+    def _public_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Return connector-safe metadata with gateway-private keys removed.
+
+        Underscore-prefixed keys are an internal gateway contract. They may
+        coordinate streaming, retries, media, or semantic-thread feedback, but
+        must never cross the relay wire boundary. Strip the whole private
+        namespace so future internal keys cannot leak by omission.
+        """
+        return {
+            key: value
+            for key, value in dict(metadata or {}).items()
+            if not str(key).startswith("_")
+        }
+
+    @staticmethod
+    def _response_generation_from_metadata(
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Read the canonical generation key, accepting the v8 alias."""
+        if not metadata:
+            return None
+        value = metadata.get("_response_generation")
+        if value is None:
+            value = metadata.get("_hermes_stream_generation")
+        return str(value) if value is not None else None
+
     def _with_scope(
         self, chat_id: str, metadata: Optional[Dict[str, Any]]
     ) -> Dict[str, Any]:
@@ -571,7 +653,7 @@ class RelayAdapter(BasePlatformAdapter):
 
         No-op when the relevant value is already present or unknown for this chat.
         """
-        meta: Dict[str, Any] = dict(metadata or {})
+        meta = self._public_metadata(metadata)
         if not meta.get("scope_id"):
             scope = self._scope_by_chat.get(str(chat_id))
             if scope:
@@ -650,6 +732,11 @@ class RelayAdapter(BasePlatformAdapter):
             if platform == "discord":
                 event = self._discord_interaction_to_event(forward)
                 if event is not None:
+                    if not self._register_passthrough_source(event.source):
+                        logger.warning(
+                            "relay passthrough_forward dropped: no live authenticated epoch"
+                        )
+                        return
                     self._capture_scope(event)
                     # Phase 3: a component press carrying a Hermes prompt token
                     # resolves its waiting primitive and is consumed (same
@@ -666,6 +753,16 @@ class RelayAdapter(BasePlatformAdapter):
             )
         except Exception:  # noqa: BLE001 - a bad forward must never break the reader
             logger.warning("relay passthrough_forward handling failed", exc_info=True)
+
+    def _register_passthrough_source(self, source: SessionSource) -> bool:
+        """Bind a derived passthrough source to the current authenticated epoch."""
+        transport = self._transport
+        epoch = getattr(transport, "authenticated_connection_epoch", None)
+        registry = getattr(transport, "_source_provenance", None)
+        if not epoch or registry is None:
+            return False
+        registry.register(source, epoch=epoch)
+        return bool(registry.verifies(source, epoch=epoch))
 
     def _discord_interaction_to_event(self, forward):
         """Convert a forwarded Discord interaction body to a MessageEvent, or None.
@@ -719,7 +816,7 @@ class RelayAdapter(BasePlatformAdapter):
         channel_id = str(payload.get("channel_id") or "")
         guild_id = payload.get("guild_id")  # real Discord interaction wire field
         source = SessionSource(
-            platform=Platform.RELAY,
+            platform=Platform.DISCORD,
             chat_id=channel_id,
             chat_type="channel" if guild_id else "dm",
             user_id=str(user.get("id"))
@@ -732,6 +829,8 @@ class RelayAdapter(BasePlatformAdapter):
             if guild_id
             else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
+            transport_route="relay",
+            delivered_via_upstream_relay=True,
         )
         event = MessageEvent(text=text, message_type=message_type, source=source)
         if itype == 3:
@@ -916,34 +1015,45 @@ class RelayAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         send_metadata = dict(metadata or {})
+        feedback_generation = str(
+            self._response_generation_from_metadata(send_metadata) or ""
+        )
+        send_metadata.pop("_response_generation", None)
+        send_metadata.pop("_hermes_stream_generation", None)
         explicit_platform = send_metadata.pop("_relay_logical_platform", None)
         if explicit_platform:
-            return await self.send_for_platform(
+            explicit_result = await self.send_for_platform(
                 explicit_platform,
                 chat_id,
                 content,
                 reply_to=reply_to,
                 metadata=send_metadata or None,
             )
-        if self._transport is None:
-            return SendResult(success=False, error="no transport")
-        # Native _resolve_thread_ts parity: a Slack DM reply must post flat at
-        # the DM root, not threaded under the triggering message. One shared
-        # helper resolves the anchor for EVERY egress lane (see
-        # _apply_slack_thread_anchor) so the text and media lanes cannot drift.
-        effective_reply_to = self._apply_slack_thread_anchor(
-            chat_id, reply_to, send_metadata
-        )
-        result = await self._transport.send_outbound(
-            {
-                "op": "send",
-                "chat_id": chat_id,
-                "content": content,
-                "reply_to": effective_reply_to,
-                "metadata": self._with_scope(chat_id, send_metadata),
-            },
-            platform=self._platform_by_chat.get(str(chat_id)),
-        )
+            result = explicit_result.raw_response or {
+                "success": explicit_result.success,
+                "message_id": explicit_result.message_id,
+                "error": explicit_result.error,
+            }
+        else:
+            if self._transport is None:
+                return SendResult(success=False, error="no transport")
+            # Native _resolve_thread_ts parity: a Slack DM reply must post flat at
+            # the DM root, not threaded under the triggering message. One shared
+            # helper resolves the anchor for EVERY egress lane (see
+            # _apply_slack_thread_anchor) so the text and media lanes cannot drift.
+            effective_reply_to = self._apply_slack_thread_anchor(
+                chat_id, reply_to, send_metadata
+            )
+            result = await self._transport.send_outbound(
+                {
+                    "op": "send",
+                    "chat_id": chat_id,
+                    "content": content,
+                    "reply_to": effective_reply_to,
+                    "metadata": self._with_scope(chat_id, send_metadata),
+                },
+                platform=self._platform_by_chat.get(str(chat_id)),
+            )
         # Auto-thread routing feedback (contract §SendResult): when the
         # connector's auto-thread egress policy routed this send into a
         # thread it just created, the result carries thread_id (+ the
@@ -956,17 +1066,30 @@ class RelayAdapter(BasePlatformAdapter):
             _at_name = result.get("auto_thread_name")
             _trigger_message = str(reply_to) if reply_to is not None else ""
             if _trigger_message:
-                _feedback_key = (str(chat_id), _trigger_message)
-                self._auto_thread_by_chat.pop(_feedback_key, None)
+                _feedback_key = (
+                    str(chat_id),
+                    _trigger_message,
+                    feedback_generation,
+                )
                 if _at_thread and _at_name:
                     self._auto_thread_by_chat[_feedback_key] = (
                         str(_at_thread),
                         str(_at_name),
                     )
-                if len(self._auto_thread_by_chat) > 256:
-                    self._auto_thread_by_chat.pop(
-                        next(iter(self._auto_thread_by_chat)), None
-                    )
+                    if len(self._auto_thread_by_chat) > 256:
+                        self._auto_thread_by_chat.pop(
+                            next(iter(self._auto_thread_by_chat)), None
+                        )
+                else:
+                    # A no-feedback chunk may clear only its own generation.
+                    # Other generations remain available to their own delayed
+                    # consumers and can never be stolen by this response. For
+                    # a generated split response, preserve feedback produced by
+                    # an earlier chunk of this same generation. Legacy direct
+                    # retries have no generation and still clear their shared
+                    # empty-generation slot.
+                    if not feedback_generation:
+                        self._auto_thread_by_chat.pop(_feedback_key, None)
         except Exception:  # noqa: BLE001 - feedback capture must never break send
             pass
         return SendResult(
@@ -976,7 +1099,11 @@ class RelayAdapter(BasePlatformAdapter):
         )
 
     def auto_thread_info_for_chat(
-        self, chat_id: str, triggering_message_id: str
+        self,
+        chat_id: str,
+        triggering_message_id: str,
+        *,
+        response_generation: Optional[str] = None,
     ) -> Optional[Tuple[str, str]]:
         """(thread_id, initial_name) of the auto-thread the connector created
         for the reply to *triggering_message_id* in *chat_id*, if any.
@@ -986,9 +1113,17 @@ class RelayAdapter(BasePlatformAdapter):
         """
         if not triggering_message_id:
             return None
-        return self._auto_thread_by_chat.pop(
-            (str(chat_id), str(triggering_message_id)), None
+        pending = self._auto_thread_by_chat.pop(
+            (
+                str(chat_id),
+                str(triggering_message_id),
+                str(response_generation or ""),
+            ),
+            None,
         )
+        if pending is None:
+            return None
+        return pending
 
     def _resolve_reply_to_for_send(
         self,
@@ -1307,7 +1442,7 @@ class RelayAdapter(BasePlatformAdapter):
                 "session_key": session_key,
                 "kind": kind,
                 "content": content,
-                "metadata": metadata or {},
+                "metadata": self._public_metadata(metadata),
             },
             platform=follow_up_platform,
         )

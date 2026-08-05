@@ -26,15 +26,21 @@ PRs #9850, #9934, #7536):
 """
 
 import asyncio
+import json
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, HomeChannel, Platform
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
+from gateway.relay.adapter import RelayAdapter
+from gateway.relay.descriptor import CapabilityDescriptor
+from gateway.source_provenance import SourceProvenanceRegistry
+from plugins.platforms.discord.adapter import DiscordAdapter
 from gateway.run import (
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
@@ -43,6 +49,7 @@ from gateway.run import (
     _last_transcript_timestamp,
     _should_clear_resume_pending_after_turn,
     build_resume_recovery_note,
+    GatewayRunner,
 )
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
@@ -79,6 +86,200 @@ def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
 
 def _make_store(tmp_path):
     return SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+
+
+def _relay_adapter() -> RelayAdapter:
+    transport = SimpleNamespace(
+        _identities=[("discord", "coder")],
+        authenticated_connection_epoch="restored-epoch",
+        _source_provenance=SourceProvenanceRegistry(),
+    )
+    return RelayAdapter(
+        PlatformConfig(enabled=True),
+        CapabilityDescriptor(
+            contract_version=1,
+            platform="discord",
+            label="Discord",
+            max_message_length=2000,
+            supports_draft_streaming=False,
+            supports_edit=True,
+            supports_threads=True,
+            markdown_dialect="discord",
+            len_unit="chars",
+        ),
+        transport=transport,
+    )
+
+
+class TestPersistedRelayResumeSource:
+    def test_snapshot_restores_only_through_current_process_relay_adapter(self):
+        live_relay = _relay_adapter()
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.RELAY: live_relay}
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="channel",
+            user_id="owner-1",
+            profile="coder",
+            guild_id="guild-1",
+            delivered_via_upstream_relay=True,
+            transport_route="relay",
+        )
+
+        snapshot = source.to_dict()
+        assert snapshot["platform"] == "discord"
+        assert snapshot["profile"] == "coder"
+        assert snapshot["transport_route"] == "relay"
+        assert "roles" not in snapshot
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            restored = runner._restored_source_for_authorization(
+                SessionSource.from_dict(snapshot), live_relay
+            )
+
+        assert restored is not None
+        assert restored.platform == Platform.DISCORD
+        assert restored.profile == "coder"
+        assert restored.transport_route == "relay"
+        assert runner._adapter_for_source(restored) is live_relay
+        assert restored.delivered_via_upstream_relay is True
+        assert restored.role_authorized is False
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("chat_id", ""),
+            ("chat_id", 123),
+            ("chat_type", "not-a-chat-type"),
+            ("chat_type", 123),
+            ("chat_topic", {"forged": "topic"}),
+            ("platform", 123),
+            ("profile", 123),
+            ("profile", ""),
+            ("profile", "   \t"),
+            ("transport_route", "native"),
+            ("user_id", 123),
+            ("thread_id", ["forged-thread"]),
+            ("scope_id", {"forged": "guild"}),
+            ("guild_id", {"forged": "guild"}),
+            ("message_id", 123),
+        ],
+    )
+    def test_malformed_relay_snapshot_is_skipped(self, field, value):
+        live_relay = _relay_adapter()
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.RELAY: live_relay}
+        snapshot = {
+            "platform": "discord",
+            "chat_id": "channel-1",
+            "chat_type": "channel",
+            "user_id": "owner-1",
+            "profile": "coder",
+            "transport_route": "relay",
+        }
+        snapshot[field] = value
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            valid_snapshot = dict(snapshot)
+            valid_snapshot[field] = {
+                "chat_id": "channel-1",
+                "chat_type": "channel",
+                "chat_topic": "topic",
+                "platform": "discord",
+                "profile": "coder",
+                "transport_route": "relay",
+                "user_id": "owner-1",
+                "thread_id": "thread-1",
+                "scope_id": "guild-1",
+                "guild_id": "guild-1",
+                "message_id": "message-1",
+            }[field]
+            assert runner._restored_source_for_authorization(
+                SessionSource.from_dict(valid_snapshot), live_relay
+            ) is not None
+
+            with pytest.raises(ValueError):
+                SessionSource.from_dict(snapshot)
+
+    def test_named_profile_restore_requires_multiplexing(self):
+        live_relay = _relay_adapter()
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        runner.adapters = {Platform.RELAY: live_relay}
+        snapshot = {
+            "platform": "discord",
+            "chat_id": "channel-1",
+            "chat_type": "channel",
+            "user_id": "owner-1",
+            "profile": "coder",
+            "delivered_via_upstream_relay": True,
+        }
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            source = SessionSource.from_dict(snapshot)
+            assert runner._restored_source_for_authorization(source, live_relay) is None
+
+    def test_malformed_persisted_entry_isolated_from_valid_resume_entry(self, tmp_path):
+        now = datetime.now()
+        valid = SessionEntry(
+            session_key="agent:main:telegram:dm:valid",
+            session_id="valid-session",
+            created_at=now,
+            updated_at=now,
+            origin=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="valid",
+                chat_type="dm",
+                user_id="owner",
+            ),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            resume_pending=True,
+        ).to_dict()
+        malformed = dict(valid)
+        malformed["session_key"] = "agent:main:invalid:dm:bad"
+        malformed["session_id"] = "malformed-session"
+        malformed["origin"] = {
+            "platform": "discord",
+            "chat_id": "channel-1",
+            "chat_type": "channel",
+            "scope_id": "guild-name",
+            "guild_id": "999",
+        }
+        (tmp_path / "sessions.json").write_text(
+            json.dumps({"malformed": malformed, "valid": valid}),
+            encoding="utf-8",
+        )
+
+        store = _make_store(tmp_path)
+        store._db = None
+        store._ensure_loaded()
+
+        assert set(store._entries) == {"valid"}
+        assert store._entries["valid"].resume_pending is True
+
+
+@pytest.mark.asyncio
+async def test_direct_final_response_carries_generation_uuid():
+    import uuid
+
+    adapter = make_restart_runner()[1]
+    adapter.config.typing_indicator = False
+    adapter.set_message_handler(AsyncMock(return_value="final answer"))
+    source = make_restart_source()
+    event = MessageEvent(text="question", message_type=MessageType.TEXT, source=source)
+    session_key = "agent:main:telegram:dm:123456"
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter._process_message_background(event, session_key)
+
+    metadata = adapter.sent_calls[-1][2]
+    generation = metadata["_response_generation"]
+    assert str(uuid.UUID(generation)) == generation
 
 
 def _build_agent_history(history: list) -> list:
@@ -578,6 +779,58 @@ async def test_drain_timeout_marks_resume_pending():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_reconstructs_persisted_relay_and_delivers_via_live_adapter():
+    """The scheduler must select relay before live provenance exists on the snapshot."""
+    runner, _native_adapter = make_restart_runner()
+    live_relay = _relay_adapter()
+    runner.config.multiplex_profiles = True
+    runner.adapters = {Platform.RELAY: live_relay}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "default"
+
+    persisted = SessionSource.from_dict(
+        {
+            "platform": "discord",
+            "chat_id": "channel-1",
+            "chat_type": "channel",
+            "user_id": "owner-1",
+            "profile": "coder",
+            "scope_id": "guild-1",
+            "transport_route": "relay",
+        }
+    )
+    assert persisted.delivered_via_upstream_relay is False
+    pending_entry = SessionEntry(
+        session_key="agent:coder:discord:channel:channel-1",
+        session_id="relay-resume-sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=persisted,
+        platform=Platform.DISCORD,
+        chat_type="channel",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    seen_authorization_sources = []
+    runner._is_user_authorized = lambda source: seen_authorization_sources.append(source) or True
+    live_relay.handle_message = AsyncMock()
+
+    with patch("hermes_cli.profiles.profile_exists", return_value=True):
+        scheduled = runner._schedule_resume_pending_sessions()
+        await asyncio.sleep(0)
+
+    assert scheduled == 1
+    live_relay.handle_message.assert_awaited_once()
+    delivered = live_relay.handle_message.await_args.args[0].source
+    assert delivered is seen_authorization_sources[0]
+    assert delivered is not persisted
+    assert delivered.delivered_via_upstream_relay is True
+    assert runner._adapter_for_source(delivered) is live_relay
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_skips_unauthorized_owner():
     """A resume-pending session whose owner is no longer authorized under the
     current allowlist must not receive a synthesized agent turn on restart.
@@ -615,6 +868,104 @@ async def test_startup_auto_resume_skips_unauthorized_owner():
     # No slot was claimed and nothing was persisted for the skipped session.
     assert pending_entry.session_key not in runner._running_agents
     runner._persist_active_agents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_malformed_source_and_continues():
+    runner, telegram_adapter = make_restart_runner()
+    discord_adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test"))
+    discord_adapter.gateway_runner = runner
+    runner.adapters[Platform.DISCORD] = discord_adapter
+    malformed_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="malformed-chat",
+        chat_type="dm",
+        chat_topic=123,
+        user_id="u1",
+    )
+    valid_source = make_restart_source(chat_id="valid-chat")
+    now = datetime.now()
+    malformed_entry = SessionEntry(
+        session_key="agent:main:discord:dm:malformed-chat",
+        session_id="malformed-sid",
+        created_at=now,
+        updated_at=now,
+        origin=malformed_source,
+        platform=Platform.DISCORD,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    valid_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:valid-chat",
+        session_id="valid-sid",
+        created_at=now,
+        updated_at=now,
+        origin=valid_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    runner.session_store._entries = {
+        malformed_entry.session_key: malformed_entry,
+        valid_entry.session_key: valid_entry,
+    }
+    telegram_adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    telegram_adapter.handle_message.assert_awaited_once()
+    assert telegram_adapter.handle_message.await_args.args[0].source == valid_source
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_malformed_profile_and_continues():
+    runner, telegram_adapter = make_restart_runner()
+    malformed_source = make_restart_source(chat_id="malformed-profile-chat")
+    malformed_source.profile = 123
+    valid_source = make_restart_source(chat_id="valid-profile-chat")
+    now = datetime.now()
+    malformed_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:malformed-profile-chat",
+        session_id="malformed-profile-sid",
+        created_at=now,
+        updated_at=now,
+        origin=malformed_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    valid_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:valid-profile-chat",
+        session_id="valid-profile-sid",
+        created_at=now,
+        updated_at=now,
+        origin=valid_source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=now,
+    )
+    runner.session_store._entries = {
+        malformed_entry.session_key: malformed_entry,
+        valid_entry.session_key: valid_entry,
+    }
+    telegram_adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    telegram_adapter.handle_message.assert_awaited_once()
+    assert telegram_adapter.handle_message.await_args.args[0].source == valid_source
 
 
 def test_startup_auto_resume_authorizes_under_persisted_profile_scope(tmp_path, monkeypatch):
@@ -664,6 +1015,10 @@ def test_startup_auto_resume_authorizes_under_persisted_profile_scope(tmp_path, 
 
     runner._is_user_authorized = authorize
     monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_profile_scope)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda name: name == "secondary",
+    )
 
     assert runner._schedule_resume_pending_sessions() == 0
     runner._resolve_profile_home_for_source.assert_called_once_with(source)

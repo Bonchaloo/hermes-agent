@@ -325,6 +325,8 @@ def noninteractive_git_env(
       instead of prompting for credentials.
     * ``GCM_INTERACTIVE=Never`` — Git Credential Manager (the default
       credential helper on Windows installs) never pops its own dialog.
+      Under WSL, ``GCM_INTERACTIVE/w`` is added to ``WSLENV`` so a Windows
+      ``git-credential-manager.exe`` receives that setting too.
 
     ``GIT_ASKPASS`` / ``SSH_ASKPASS`` are deliberately left alone: when the
     user has a *working* askpass helper or ssh-agent configured, auth should
@@ -341,6 +343,25 @@ def noninteractive_git_env(
     env = dict(base if base is not None else os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env["GCM_INTERACTIVE"] = "Never"
+    if env.get("WSL_INTEROP") or env.get("WSL_DISTRO_NAME"):
+        entries = [entry for entry in env.get("WSLENV", "").split(":") if entry]
+        updated: list[str] = []
+        inserted = False
+        for entry in entries:
+            name, _separator, flags = entry.partition("/")
+            if name != "GCM_INTERACTIVE":
+                updated.append(entry)
+                continue
+            if inserted:
+                continue
+            # `/w` exports a WSL variable to Win32 children. Preserve any
+            # path/list transforms while replacing a conflicting direction.
+            retained_flags = "".join(flag for flag in flags if flag not in "uw")
+            updated.append(f"GCM_INTERACTIVE/{retained_flags}w")
+            inserted = True
+        if not inserted:
+            updated.append("GCM_INTERACTIVE/w")
+        env["WSLENV"] = ":".join(updated)
     return env
 
 

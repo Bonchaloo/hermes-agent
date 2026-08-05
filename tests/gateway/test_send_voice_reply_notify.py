@@ -76,6 +76,7 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
     runner = _runner_with_adapter(send_voice)
     # Use a DM topic source so _thread_metadata_for_source returns a non-None dict.
     event = _make_event(thread_id="17585")
+    event._response_generation = "auto-tts-generation"
     source_meta_snapshot = runner._thread_metadata_for_source(
         event.source, runner._reply_anchor_for_event(event)
     )
@@ -87,6 +88,7 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
     send_voice.assert_awaited_once()
     kwargs = send_voice.await_args.kwargs
     assert kwargs["metadata"].get("notify") is True
+    assert kwargs["metadata"]["_response_generation"] == "auto-tts-generation"
     # All pre-existing thread keys are preserved.
     for k, v in snapshot_copy.items():
         assert kwargs["metadata"].get(k) == v

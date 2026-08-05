@@ -56,6 +56,35 @@ class TestNoninteractiveGitEnv:
         env = noninteractive_git_env({"GIT_TERMINAL_PROMPT": "1"})
         assert env["GIT_TERMINAL_PROMPT"] == "0"
 
+    def test_preserves_cached_credential_helper_config(self):
+        env = noninteractive_git_env({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "cache",
+        })
+
+        assert env["GIT_CONFIG_COUNT"] == "1"
+        assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+        assert env["GIT_CONFIG_VALUE_0"] == "cache"
+
+    def test_wsl_exports_gcm_interactive_to_windows_helpers(self):
+        env = noninteractive_git_env({"WSL_DISTRO_NAME": "Ubuntu"})
+
+        assert env["WSLENV"] == "GCM_INTERACTIVE/w"
+
+    def test_wsl_preserves_existing_wslenv_entries_and_deduplicates_gcm(self):
+        env = noninteractive_git_env({
+            "WSL_INTEROP": "/run/WSL/1_interop",
+            "WSLENV": "PATH/lp:GCM_INTERACTIVE/u:GCM_INTERACTIVE/w:OTHER/p",
+        })
+
+        assert env["WSLENV"] == "PATH/lp:GCM_INTERACTIVE/w:OTHER/p"
+
+    def test_non_wsl_environment_does_not_gain_wslenv(self):
+        env = noninteractive_git_env({})
+
+        assert "WSLENV" not in env
+
 
 # ---------------------------------------------------------------------------
 # 2. Real-git E2E: 401 remote fails fast instead of prompting
@@ -83,6 +112,33 @@ def test_git_clone_against_auth_remote_fails_fast(tmp_path: Path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
+        home = tmp_path / "home"
+        xdg_config_home = tmp_path / "xdg"
+        home.mkdir()
+        xdg_config_home.mkdir()
+        child_env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("GIT_CONFIG_", "GCM_"))
+            and key
+            not in {
+                "GIT_ASKPASS",
+                "GIT_ASKPASS_REQUIRE",
+                "SSH_ASKPASS",
+                "SSH_ASKPASS_REQUIRE",
+            }
+        }
+        child_env.update({
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(xdg_config_home),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            # Disable helpers only for this isolated E2E. Production keeps
+            # valid cached helpers and controls their interactive mode.
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "",
+        })
         t0 = time.monotonic()
         proc = subprocess.run(
             ["git", "clone", f"http://127.0.0.1:{port}/private.git",
@@ -91,7 +147,7 @@ def test_git_clone_against_auth_remote_fails_fast(tmp_path: Path):
             text=True,
             timeout=30,
             stdin=subprocess.DEVNULL,
-            env=noninteractive_git_env(),
+            env=noninteractive_git_env(child_env),
         )
         elapsed = time.monotonic() - t0
         assert proc.returncode != 0

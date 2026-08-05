@@ -56,6 +56,88 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
 
+    @pytest.mark.parametrize("guild_id", ["guild-name", "123456789012345678"])
+    def test_deprecated_guild_id_is_scope_fallback_for_names_and_ids(self, guild_id):
+        restored = SessionSource.from_dict(
+            {
+                "platform": "discord",
+                "chat_id": "channel-1",
+                "chat_type": "channel",
+                "guild_id": guild_id,
+            }
+        )
+
+        assert restored.scope_id == restored.guild_id == guild_id
+
+    @pytest.mark.parametrize(
+        ("scope_id", "guild_id"),
+        [("guild-name", "guild-name"), ("123456789012345678", "123456789012345678")],
+    )
+    def test_matching_scope_and_guild_aliases_are_accepted(self, scope_id, guild_id):
+        restored = SessionSource.from_dict(
+            {
+                "platform": "discord",
+                "chat_id": "channel-1",
+                "chat_type": "channel",
+                "scope_id": scope_id,
+                "guild_id": guild_id,
+            }
+        )
+
+        assert restored.scope_id == restored.guild_id == scope_id
+
+    @pytest.mark.parametrize("scope_id", [None, "guild-name", "123456789012345678"])
+    def test_dm_without_guild_alias_preserves_optional_scope(self, scope_id):
+        restored = SessionSource.from_dict(
+            {
+                "platform": "discord",
+                "chat_id": "dm-1",
+                "chat_type": "dm",
+                "scope_id": scope_id,
+            }
+        )
+
+        assert restored.scope_id == restored.guild_id == scope_id
+
+    @pytest.mark.parametrize("guild_id", [[], "", "   \t", "other-guild", "999"])
+    def test_valid_scope_cannot_mask_malformed_or_conflicting_guild_alias(self, guild_id):
+        with pytest.raises(ValueError):
+            SessionSource.from_dict(
+                {
+                    "platform": "discord",
+                    "chat_id": "channel-1",
+                    "chat_type": "channel",
+                    "scope_id": "guild-name",
+                    "guild_id": guild_id,
+                }
+            )
+
+    @pytest.mark.parametrize("scope_id", [[], "", "   \t"])
+    def test_malformed_scope_cannot_fall_back_to_valid_guild_alias(self, scope_id):
+        with pytest.raises(ValueError):
+            SessionSource.from_dict(
+                {
+                    "platform": "discord",
+                    "chat_id": "channel-1",
+                    "chat_type": "channel",
+                    "scope_id": scope_id,
+                    "guild_id": "guild-name",
+                }
+            )
+
+    def test_none_scope_uses_valid_guild_alias_fallback(self):
+        restored = SessionSource.from_dict(
+            {
+                "platform": "discord",
+                "chat_id": "channel-1",
+                "chat_type": "channel",
+                "scope_id": None,
+                "guild_id": "guild-name",
+            }
+        )
+
+        assert restored.scope_id == restored.guild_id == "guild-name"
+
 
 class TestSessionSourceDescription:
     def test_local_cli(self):

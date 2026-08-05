@@ -111,3 +111,58 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert str(media_file) in images_kwargs["images"][0][0]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "method_name"),
+    [
+        ("chart.png", "send_multiple_images"),
+        ("report.pdf", "send_document"),
+        ("clip.mp4", "send_video"),
+        ("reply.ogg", "send_voice"),
+    ],
+)
+async def test_every_post_stream_media_lane_carries_same_response_generation(
+    tmp_path, monkeypatch, name, method_name
+):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, name)
+    adapter = _adapter()
+    event = _event()
+    event._response_generation = "post-stream-generation"
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "thread-1"}),
+        f"MEDIA:{media_file}",
+        event,
+        adapter,
+    )
+
+    method = getattr(adapter, method_name)
+    method.assert_awaited_once()
+    metadata = method.await_args.kwargs["metadata"]
+    assert metadata["_response_generation"] == "post-stream-generation"
+    assert metadata["notify"] is True
+    assert metadata["thread_id"] == "thread-1"
+
+
+@pytest.mark.asyncio
+async def test_streaming_runtime_footer_carries_turn_response_generation():
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner = SimpleNamespace(
+        _adapter_for_source=lambda source: adapter,
+        _thread_metadata_for_source=lambda source, anchor=None: {
+            "thread_id": "thread-1"
+        },
+        _reply_anchor_for_event=lambda event: "message-1",
+    )
+    event = _event()
+    event._response_generation = "footer-generation"
+
+    await GatewayRunner._send_streaming_runtime_footer(
+        runner, event, event.source, "runtime footer"
+    )
+
+    adapter.send.assert_awaited_once()
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["_response_generation"] == "footer-generation"
+    assert metadata["notify"] is True
+    assert metadata["thread_id"] == "thread-1"

@@ -34,6 +34,48 @@ def test_find_git_worktree_finds_dotgit(tmp_path: Path):
     assert find_git_worktree(str(sub)) == str(repo)
 
 
+def test_find_git_worktree_ignores_system_temp_root(tmp_path: Path, monkeypatch):
+    system_temp = tmp_path / "system-temp"
+    nested = system_temp / "pytest-case"
+    nested.mkdir(parents=True)
+    (system_temp / ".git").mkdir()
+    monkeypatch.setattr(
+        "agent.lsp.workspace.tempfile.gettempdir", lambda: str(system_temp)
+    )
+
+    assert find_git_worktree(str(nested)) is None
+
+
+def test_find_git_worktree_ignores_temp_root_symlink_alias(
+    tmp_path: Path, monkeypatch
+):
+    system_temp = tmp_path / "system-temp"
+    nested = system_temp / "pytest-case"
+    nested.mkdir(parents=True)
+    (system_temp / ".git").mkdir()
+    alias = tmp_path / "temp-alias"
+    alias.symlink_to(system_temp, target_is_directory=True)
+    monkeypatch.setattr(
+        "agent.lsp.workspace.tempfile.gettempdir", lambda: str(system_temp)
+    )
+
+    assert find_git_worktree(str(alias / "pytest-case")) is None
+
+
+def test_find_git_worktree_preserves_nested_temp_repo(tmp_path: Path, monkeypatch):
+    system_temp = tmp_path / "system-temp"
+    repo = system_temp / "project"
+    nested = repo / "src"
+    nested.mkdir(parents=True)
+    (system_temp / ".git").mkdir()
+    (repo / ".git").mkdir()
+    monkeypatch.setattr(
+        "agent.lsp.workspace.tempfile.gettempdir", lambda: str(system_temp)
+    )
+
+    assert find_git_worktree(str(nested)) == str(repo)
+
+
 
 
 

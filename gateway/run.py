@@ -40,6 +40,7 @@ import sys
 import signal
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -2265,6 +2266,7 @@ from gateway.platforms.base import (
     MessageType,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
+    _response_metadata_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
     utf16_len,
@@ -4402,6 +4404,7 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        response_generation=ctx.response_generation,
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -5568,6 +5571,7 @@ class TurnRunner:
                         ctx.source,
                         effective_session_id,
                         title,
+                        response_generation=ctx.response_generation,
                     )
                 maybe_auto_title(
                     getattr(self._runner._session_db, "_db", self._runner._session_db),
@@ -10385,10 +10389,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             source = entry.origin
-            adapter = self._adapter_for_source(source)
+            adapter = self._candidate_adapter_for_restored_source(source)
             if adapter is None:
                 logger.debug(
                     "Skipping auto-resume for %s: adapter not ready for %s",
+                    entry.session_key,
+                    getattr(source.platform, "value", source.platform),
+                )
+                continue
+
+            authorization_source = self._restored_source_for_authorization(
+                source, adapter
+            )
+            if authorization_source is None:
+                logger.warning(
+                    "Skipping auto-resume for %s: source provenance could not "
+                    "be reconstructed for %s",
                     entry.session_key,
                     getattr(source.platform, "value", source.platform),
                 )
@@ -10405,9 +10421,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     with _profile_runtime_scope(
                         self._resolve_profile_home_for_source(source)
                     ):
-                        authorized = self._is_user_authorized(source)
+                        authorized = self._is_user_authorized(authorization_source)
                 else:
-                    authorized = self._is_user_authorized(source)
+                    authorized = self._is_user_authorized(authorization_source)
                 if not authorized:
                     logger.warning(
                         "Skipping auto-resume for %s: session owner is no "
@@ -10438,7 +10454,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             event = MessageEvent(
                 text="",
                 message_type=MessageType.TEXT,
-                source=source,
+                source=authorization_source,
                 internal=True,
             )
             task = asyncio.create_task(
@@ -10970,9 +10986,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-            adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+            adapter.set_authorization_check(
+                self._make_adapter_auth_check(adapter.platform, adapter=adapter)
+            )
             adapter._busy_text_mode = self._busy_text_mode
-            
+
             # Try to connect
             logger.info("Connecting to %s...", platform.value)
             self._update_platform_runtime_status(
@@ -10993,7 +11011,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Wire voice input callback at connect time so voice
                     # transcription is forwarded without requiring /voice join.
                     if hasattr(adapter, "_voice_input_callback"):
-                        adapter._voice_input_callback = self._handle_voice_channel_input
+                        adapter._voice_input_callback = (
+                            self._voice_input_callback_for_adapter(adapter)
+                        )
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -12342,7 +12362,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    adapter.set_authorization_check(
+                        self._make_adapter_auth_check(adapter.platform, adapter=adapter)
+                    )
                     adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
@@ -12356,7 +12378,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
-                            adapter._voice_input_callback = self._handle_voice_channel_input
+                            adapter._voice_input_callback = (
+                                self._voice_input_callback_for_adapter(adapter)
+                            )
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -13274,6 +13298,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        # ``build_source`` reads this immutable adapter ownership hint before it
+        # registers source provenance. Never stamp source.profile in the handler
+        # after registration.
+        adapter._gateway_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -13285,7 +13313,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _set_reaction(self._handle_reaction_event)
         adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
         adapter.set_authorization_check(
-            self._make_adapter_auth_check(platform, profile_name=profile_name)
+            self._make_adapter_auth_check(
+                platform,
+                profile_name=profile_name,
+                adapter=adapter,
+            )
         )
         adapter._busy_text_mode = self._busy_text_mode
 
@@ -13457,12 +13489,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # never rebuild a secondary adapter with the default profile's credentials.
 
     def _make_profile_message_handler(self, profile_name: str):
-        """Return a message handler that stamps source.profile then delegates.
+        """Return a handler for sources atomically bound to one profile.
 
         Auth runs inside ``_handle_message`` *before* the agent-turn scope is
         installed. For secondary profiles under multiplex, wrap the whole
         handler in ``_profile_runtime_scope`` so allowlists/tokens from that
-        profile's ``.env`` are visible to ``get_secret`` / authz.
+        profile's ``.env`` are visible to ``get_secret`` / authz. An unstamped
+        or cross-profile source is rejected rather than mutated after immutable
+        adapter provenance was registered.
         """
         from hermes_cli.profiles import get_profile_dir
 
@@ -13472,11 +13506,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_home = None
 
         async def _handler(event):
-            try:
-                if getattr(event, "source", None) is not None and not event.source.profile:
-                    event.source.profile = profile_name
-            except Exception:
-                pass
+            source = getattr(event, "source", None)
+            if source is None or getattr(source, "profile", None) != profile_name:
+                logger.warning(
+                    "Dropping secondary-profile event with mismatched source profile "
+                    "(expected=%s, got=%s)",
+                    profile_name,
+                    getattr(source, "profile", None),
+                )
+                return None
             if profile_home is not None:
                 with _profile_runtime_scope(profile_home):
                     return await self._handle_message(event)
@@ -13716,6 +13754,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         platform: Platform,
         profile_name: Optional[str] = None,
+        adapter=None,
     ) -> Callable[[str, Optional[str], Optional[str]], bool]:
         """Build a platform-bound auth callback for adapter use.
 
@@ -13739,6 +13778,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_id: Optional[str] = None,
         ) -> bool:
             if not user_id:
+                return False
+            build_source = getattr(adapter, "build_source", None)
+            if callable(build_source):
+                authorization_source = build_source(
+                    chat_id=chat_id or "",
+                    chat_type=chat_type or "group",
+                    user_id=user_id,
+                    _profile_override=profile_name,
+                )
+                return self._is_user_authorized(authorization_source)
+            if platform == Platform.DISCORD:
                 return False
             source = SessionSource(
                 platform=platform,
@@ -17387,7 +17437,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                response_generation=event._response_generation,
             )
+            if agent_result.get("response_generation"):
+                event._response_generation = agent_result["response_generation"]
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # Stop persistent typing indicator now that the agent is done.
@@ -17989,16 +18042,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Send it now as a small trailing message so Telegram/Discord/etc.
                 # still surface the runtime metadata on the final reply.
                 if _footer_line:
-                    try:
-                        _foot_adapter = self._adapter_for_source(source)
-                        if _foot_adapter:
-                            await _foot_adapter.send(
-                                source.chat_id,
-                                _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
-                            )
-                    except Exception as _e:
-                        logger.debug("trailing footer send failed: %s", _e)
+                    await self._send_streaming_runtime_footer(
+                        event, source, _footer_line
+                    )
                 return None
 
             return response
@@ -18732,7 +18778,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+            adapter._voice_input_callback = self._voice_input_callback_for_adapter(
+                adapter
+            )
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
         # Let the adapter's inactivity timer see the live voice-reply mode so it
@@ -18844,37 +18892,174 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recent_store[key] = recent[-5:]
         return False
 
+    def _voice_input_callback_for_adapter(self, adapter):
+        """Bind voice input to the registered adapter that received its audio."""
+        async def _callback(*, guild_id: int, user_id: int, transcript: str):
+            await self._handle_voice_channel_input(
+                guild_id,
+                user_id,
+                transcript,
+                _adapter=adapter,
+            )
+
+        return _callback
+
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        _adapter=None,
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = _adapter or self.adapters.get(Platform.DISCORD)
         if not adapter:
             return
+        if _adapter is not None:
+            is_registered = adapter is self.adapters.get(Platform.DISCORD) or any(
+                adapter is profile_adapters.get(Platform.DISCORD)
+                for profile_adapters in self._profile_adapters.values()
+            )
+            if not is_registered:
+                logger.warning(
+                    "Ignoring voice input for guild=%s: Discord adapter is not registered",
+                    guild_id,
+                )
+                return
 
         text_ch_id = adapter._voice_text_channels.get(guild_id)
         if not text_ch_id:
             return
 
-        # Build source — reuse the linked text channel's metadata when available
-        # so voice input shares the same session as the bound text conversation.
+        # Build the complete final source atomically through the exact live
+        # Discord adapter.  ``build_source`` registers immutable provenance, so
+        # no source field may be changed after this call.
         source_data = getattr(adapter, "_voice_sources", {}).get(guild_id)
-        if source_data:
-            source = SessionSource.from_dict(source_data)
-            source.user_id = str(user_id)
-            source.user_name = str(user_id)
-        else:
-            source = SessionSource(
-                platform=Platform.DISCORD,
-                chat_id=str(text_ch_id),
-                user_id=str(user_id),
-                user_name=str(user_id),
-                chat_type="channel",
+        linked_source = None
+        if source_data is not None:
+            if not isinstance(source_data, dict):
+                logger.warning(
+                    "Ignoring voice input for guild=%s: malformed linked source",
+                    guild_id,
+                )
+                return
+            try:
+                linked_source = SessionSource.from_dict(source_data)
+            except (KeyError, TypeError, ValueError):
+                logger.warning(
+                    "Ignoring voice input for guild=%s: malformed linked source",
+                    guild_id,
+                )
+                return
+            if linked_source.platform != Platform.DISCORD:
+                logger.warning(
+                    "Ignoring voice input for guild=%s: linked source is not Discord",
+                    guild_id,
+                )
+                return
+
+        guild_id_str = str(guild_id)
+        member = None
+        client = getattr(adapter, "_client", None)
+        get_guild = getattr(client, "get_guild", None)
+        if callable(get_guild):
+            try:
+                guild = get_guild(guild_id)
+                get_member = getattr(guild, "get_member", None)
+                if callable(get_member):
+                    member = get_member(int(user_id))
+            except (TypeError, ValueError):
+                member = None
+
+        user_name = str(user_id)
+        if member is not None:
+            display_name = getattr(member, "display_name", None) or getattr(
+                member, "name", None
             )
+            if display_name:
+                user_name = str(display_name)
+
+        allowed_roles = getattr(adapter, "_allowed_role_ids", None) or set()
+        member_roles = getattr(member, "roles", None) or []
+        role_authorized = bool(
+            allowed_roles
+            and any(
+                getattr(role, "id", None) in allowed_roles for role in member_roles
+            )
+        )
+
+        if linked_source is not None:
+            if (
+                linked_source.chat_type
+                not in {"group", "forum", "channel", "thread"}
+                or str(linked_source.chat_id) != str(text_ch_id)
+                or (
+                    linked_source.scope_id is not None
+                    and linked_source.scope_id != guild_id_str
+                )
+            ):
+                logger.warning(
+                    "Ignoring voice input for guild=%s: linked source route mismatch",
+                    guild_id,
+                )
+                return
+            source_kwargs = {
+                "chat_id": linked_source.chat_id,
+                "chat_name": linked_source.chat_name,
+                "chat_type": linked_source.chat_type,
+                "thread_id": linked_source.thread_id,
+                "chat_topic": linked_source.chat_topic,
+                "user_id_alt": linked_source.user_id_alt,
+                "chat_id_alt": linked_source.chat_id_alt,
+                "scope_id": linked_source.scope_id or guild_id_str,
+                "guild_id": linked_source.guild_id or guild_id_str,
+                "parent_chat_id": linked_source.parent_chat_id,
+                "message_id": linked_source.message_id,
+                "auto_thread_created": linked_source.auto_thread_created,
+                "auto_thread_initial_name": linked_source.auto_thread_initial_name,
+                "_profile_override": linked_source.profile,
+            }
+        else:
+            source_kwargs = {
+                "chat_id": str(text_ch_id),
+                "chat_type": "channel",
+                "scope_id": guild_id_str,
+                "guild_id": guild_id_str,
+            }
+
+        build_source = getattr(adapter, "build_source", None)
+        if not callable(build_source):
+            logger.warning(
+                "Ignoring voice input for guild=%s: Discord source builder unavailable",
+                guild_id,
+            )
+            return
+        try:
+            source = build_source(
+                **source_kwargs,
+                user_id=str(user_id),
+                user_name=user_name,
+                is_bot=False,
+                role_authorized=role_authorized,
+            )
+        except (AttributeError, TypeError, ValueError):
+            logger.warning(
+                "Ignoring voice input for guild=%s: Discord source build failed",
+                guild_id,
+                exc_info=True,
+            )
+            return
+        if not isinstance(source, SessionSource):
+            logger.warning(
+                "Ignoring voice input for guild=%s: Discord source builder returned invalid source",
+                guild_id,
+            )
+            return
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
@@ -19003,6 +19188,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
+    async def _send_streaming_runtime_footer(
+        self, event: MessageEvent, source: SessionSource, footer_line: str
+    ) -> None:
+        """Deliver a post-stream footer with the turn's canonical response UUID."""
+        try:
+            adapter = self._adapter_for_source(source)
+            if adapter:
+                await adapter.send(
+                    source.chat_id,
+                    footer_line,
+                    metadata=_response_metadata_for_event(
+                        event,
+                        self._thread_metadata_for_source(
+                            source, self._reply_anchor_for_event(event)
+                        ),
+                        notify=True,
+                    ),
+                )
+        except Exception as exc:
+            logger.debug("trailing footer send failed: %s", exc)
+
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
         audio_path = None
@@ -19055,11 +19261,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # final voice reply as a normal notification instead of a
                 # silent message.  Clone first so we don't mutate metadata
                 # shared with concurrent typing-indicator state.
-                if thread_meta is not None:
-                    thread_meta = dict(thread_meta)
-                    thread_meta["notify"] = True
-                else:
-                    thread_meta = {"notify": True}
+                thread_meta = _response_metadata_for_event(
+                    event, thread_meta, notify=True
+                )
                 send_kwargs: Dict[str, Any] = {
                     "chat_id": event.source.chat_id,
                     "audio_path": actual_path,
@@ -19127,7 +19331,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # stale inspected content), not an attachment request.
             adapter.extract_images(cleaned)
 
-            _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            _thread_meta = _response_metadata_for_event(
+                event,
+                self._thread_metadata_for_source(
+                    event.source, self._reply_anchor_for_event(event)
+                ),
+                notify=True,
+            )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -19550,7 +19760,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     def _relay_auto_thread_info(
-        self, source: SessionSource
+        self,
+        source: SessionSource,
+        response_generation: Optional[str] = None,
     ) -> Optional[Tuple[str, str]]:
         """(thread_id, initial_name) when the RELAY connector auto-threaded our
         reply to this source's chat — the title-turn sibling of
@@ -19595,7 +19807,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not callable(info_fn):
             return None
         try:
-            info = info_fn(str(source.chat_id), str(triggering_message_id))
+            info = info_fn(
+                str(source.chat_id),
+                str(triggering_message_id),
+                response_generation=response_generation,
+            )
             if (
                 isinstance(info, tuple)
                 and len(info) == 2
@@ -19626,6 +19842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_id: str,
         title: str,
         relay_info: Optional[Tuple[str, str]] = None,
+        response_generation: Optional[str] = None,
     ) -> None:
         """Best-effort semantic rename of a newly auto-created Discord thread.
 
@@ -19646,7 +19863,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not self._is_relay_discord_channel_lane(source):
                 return
             for _ in range(20):  # up to ~10s
-                relay_info = self._relay_auto_thread_info(source)
+                relay_info = self._relay_auto_thread_info(
+                    source,
+                    response_generation=response_generation,
+                )
                 if relay_info is not None:
                     break
                 await asyncio.sleep(0.5)
@@ -19721,6 +19941,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
+        response_generation: Optional[str] = None,
     ) -> None:
         """Schedule Discord auto-thread rename from the auto-title background thread."""
         relay_info = None
@@ -19734,7 +19955,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # produces it, so a cache miss HERE is not a verdict. Schedule
             # whenever the SHAPE matches; the async rename lane polls the
             # cache (with a bounded wait) and no-ops on a true miss.
-            relay_info = self._relay_auto_thread_info(source)
+            relay_info = self._relay_auto_thread_info(
+                source,
+                response_generation=response_generation,
+            )
             if relay_info is None and not self._is_relay_discord_channel_lane(
                 source
             ):
@@ -19751,7 +19975,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             copied_source = source
         future = safe_schedule_threadsafe(
             self._rename_discord_auto_thread_for_session_title(
-                copied_source, session_id, title, relay_info=relay_info
+                copied_source,
+                session_id,
+                title,
+                relay_info=relay_info,
+                response_generation=response_generation,
             ),
             loop,
             logger=logger,
@@ -23573,6 +23801,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        response_generation: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -23700,6 +23929,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        response_generation=response_generation,
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -23864,6 +24094,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        response_generation: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23883,6 +24114,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                response_generation=response_generation,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23895,6 +24127,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                response_generation=response_generation,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24017,6 +24250,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        response_generation: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24030,9 +24264,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        response_generation = response_generation or str(uuid.uuid4())
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            proxy_result = await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
                 history=history,
@@ -24041,7 +24277,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                response_generation=response_generation,
             )
+            if isinstance(proxy_result, dict):
+                proxy_result.setdefault("response_generation", response_generation)
+            return proxy_result
 
         from run_agent import AIAgent
         import queue
@@ -24296,6 +24536,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_id=session_id,
             session_key=session_key,
             run_generation=run_generation,
+            response_generation=response_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             moa_config=moa_config,
@@ -24486,6 +24727,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_message_id=event_message_id,
                 )
             ) if _progress_thread_id else None
+        _status_thread_metadata = dict(_status_thread_metadata or {})
+        _status_thread_metadata["_response_generation"] = response_generation
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the
@@ -25148,6 +25391,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
+            if isinstance(result, dict):
+                result.setdefault("response_generation", response_generation)
+            if isinstance(response, dict):
+                response.setdefault("response_generation", response_generation)
             adapter = self._adapter_for_source(source)
 
             # Finalize the streaming-TTS consumer (#60671).
@@ -25344,7 +25591,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await adapter.send(
                                 source.chat_id,
                                 first_response,
-                                metadata=_status_thread_metadata,
+                                metadata={
+                                    **(_status_thread_metadata or {}),
+                                    "_response_generation": response_generation,
+                                },
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -25425,6 +25675,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
+                next_response_generation = (
+                    getattr(pending_event, "_response_generation", None)
+                    if pending_event is not None
+                    else None
+                ) or str(uuid.uuid4())
+                if pending_event is not None:
+                    pending_event._response_generation = next_response_generation
+
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
                 # by the prior turn's completion (#60671).
@@ -25446,7 +25704,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         await _followup_adapter.send_typing(
                             source.chat_id,
-                            metadata=_status_thread_metadata,
+                            metadata={
+                                **(_status_thread_metadata or {}),
+                                "_response_generation": next_response_generation,
+                            },
                         )
                     except Exception:
                         pass
@@ -25479,6 +25740,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    response_generation=next_response_generation,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
