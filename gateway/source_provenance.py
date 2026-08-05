@@ -10,24 +10,36 @@ from __future__ import annotations
 
 import dataclasses
 import weakref
+from enum import Enum
 from typing import Any
 
 
 def _freeze(value: Any) -> Any:
-    if isinstance(value, dict):
-        return tuple(sorted((str(key), _freeze(item)) for key, item in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    if isinstance(value, set):
-        return tuple(sorted(_freeze(item) for item in value))
-    enum_value = getattr(value, "value", None)
-    if enum_value is not None:
-        return (type(value).__qualname__, _freeze(enum_value))
-    try:
-        hash(value)
-    except TypeError:
-        return repr(value)
-    return value
+    concrete_type = type(value)
+    type_tag = (concrete_type,)
+    if concrete_type is dict:
+        return (
+            *type_tag,
+            frozenset((_freeze(key), _freeze(item)) for key, item in value.items()),
+        )
+    if concrete_type is list:
+        return (*type_tag, tuple(_freeze(item) for item in value))
+    if concrete_type is tuple:
+        return (*type_tag, tuple(_freeze(item) for item in value))
+    if concrete_type in (set, frozenset):
+        return (*type_tag, frozenset(_freeze(item) for item in value))
+    if isinstance(value, Enum):
+        return (*type_tag, _freeze(value.value))
+    if concrete_type is float:
+        return (*type_tag, value.hex())
+    if value is None or concrete_type in (bool, int, str, bytes):
+        return (*type_tag, value)
+    # SessionSource fields are expected to use only the primitives and
+    # containers above.  Never invoke arbitrary equality, ``repr``, or a
+    # synthetic ``.value`` attribute on an unexpected object (for example,
+    # MagicMock dynamically creates one).  Reject it so registration fails
+    # closed instead of granting trust to an incomplete snapshot.
+    raise TypeError(f"unsupported source fingerprint type: {concrete_type.__qualname__}")
 
 
 def source_auth_fingerprint(source: Any) -> tuple[Any, ...]:
@@ -51,6 +63,14 @@ class SourceProvenanceRegistry:
     def register(self, source: Any, *, epoch: str | None = None) -> None:
         source_id = id(source)
 
+        try:
+            fingerprint = source_auth_fingerprint(source)
+        except Exception:
+            # Registration is a trust boundary.  A malformed field must leave
+            # no usable capability, including one recorded by an earlier call.
+            self._records.pop(source_id, None)
+            return
+
         def discard(reference: weakref.ReferenceType[Any]) -> None:
             current = self._records.get(source_id)
             if current is not None and current[0] is reference:
@@ -59,7 +79,7 @@ class SourceProvenanceRegistry:
         reference = weakref.ref(source, discard)
         self._records[source_id] = (
             reference,
-            source_auth_fingerprint(source),
+            fingerprint,
             epoch,
         )
 
@@ -72,7 +92,7 @@ class SourceProvenanceRegistry:
             return False
         try:
             return fingerprint == source_auth_fingerprint(source)
-        except (AttributeError, TypeError, ValueError):
+        except Exception:
             return False
 
     def clear(self) -> None:

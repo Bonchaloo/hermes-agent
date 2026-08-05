@@ -111,14 +111,16 @@ class TestBasePlatformTopicSessions:
         event = _make_event("-1001", "17585")
         await adapter._process_message_background(event, build_session_key(event.source))
 
-        assert adapter.sent == [
-            {
-                "chat_id": "-1001",
-                "content": "ack",
-                "reply_to": None,
-                "metadata": {"thread_id": "17585", "notify": True},
-            }
-        ]
+        assert len(adapter.sent) == 1
+        response = adapter.sent[0]
+        assert response["chat_id"] == "-1001"
+        assert response["content"] == "ack"
+        assert response["reply_to"] is None
+        assert response["metadata"]["thread_id"] == "17585"
+        assert response["metadata"]["notify"] is True
+        generation = response["metadata"]["_response_generation"]
+        assert generation
+        assert generation == event._response_generation
         assert typing_calls == [
             {
                 "chat_id": "-1001",
@@ -190,12 +192,14 @@ class TestTelegramAutoTtsCaptionDelivery:
 
         adapter.play_tts.assert_awaited_once()
         assert adapter.play_tts.await_args.kwargs["caption"] is None
-        assert adapter.sent == [
-            {
-                "chat_id": "-1001",
-                "content": long_reply,
-                "reply_to": None,
-                "metadata": {"thread_id": "17585", "notify": True},
-            }
-        ]
+        assert len(adapter.sent) == 1
+        response = adapter.sent[0]
+        assert response["chat_id"] == "-1001"
+        assert response["content"] == long_reply
+        assert response["reply_to"] is None
+        assert response["metadata"]["thread_id"] == "17585"
+        assert response["metadata"]["notify"] is True
+        generation = response["metadata"]["_response_generation"]
+        assert generation
+        assert generation == event._response_generation
 

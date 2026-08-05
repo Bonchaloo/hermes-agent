@@ -436,15 +436,14 @@ class GatewayAuthorizationMixin:
         Relay persistence carries only the non-authoritative ``transport_route``
         discriminator.  Startup may promote that descriptor into a live relay
         source only after binding it to the one current process RelayAdapter,
-        validating its exact underlying Discord platform/profile, and registering
-        the rebuilt object in the current authenticated connection epoch.
+        validating its exact underlying advertised platform and persisted profile,
+        and registering the rebuilt object in the current authenticated connection
+        epoch.
         """
         if getattr(source, "transport_route", None) != "relay":
             return self._restored_native_source_for_authorization(source, adapter)
 
         if getattr(source, "_persisted_metadata_valid", True) is not True:
-            return None
-        if source.platform != Platform.DISCORD:
             return None
         if adapter is not (getattr(self, "adapters", None) or {}).get(Platform.RELAY):
             return None
@@ -518,8 +517,10 @@ class GatewayAuthorizationMixin:
         registry.register(rebuilt, epoch=epoch)
 
         # Rehydrate only delivery discriminators.  Authorization below is always
-        # recomputed from the current profile-scoped Discord policy; no persisted
-        # role grant or prior-process provenance survives this boundary.
+        # recomputed for the exact underlying platform/profile. Discord policy is
+        # applied only to Discord; other advertised platforms rely on authenticated
+        # upstream authorization. No persisted role grant or prior-process
+        # provenance survives this boundary.
         capture_scope = getattr(adapter, "_capture_scope", None)
         if callable(capture_scope):
             capture_scope(type("RestoredRelayEvent", (), {"source": rebuilt})())

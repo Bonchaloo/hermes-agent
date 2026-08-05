@@ -148,6 +148,88 @@ class TestPersistedRelayResumeSource:
         assert restored.delivered_via_upstream_relay is True
         assert restored.role_authorized is False
 
+    def test_slack_snapshot_restores_through_fronting_live_relay(self):
+        live_relay = _relay_adapter()
+        live_relay._transport._identities = [("slack", "coder")]
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.RELAY: live_relay}
+        source = SessionSource.from_dict(
+            {
+                "platform": "slack",
+                "chat_id": "channel-slack",
+                "chat_type": "channel",
+                "user_id": "owner-slack",
+                "profile": "coder",
+                "transport_route": "relay",
+            }
+        )
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            restored = runner._restored_source_for_authorization(source, live_relay)
+
+        assert restored is not None
+        assert restored is not source
+        assert restored.platform == Platform.SLACK
+        assert restored.profile == "coder"
+        assert restored.transport_route == "relay"
+        assert restored.delivered_via_upstream_relay is True
+        assert live_relay._transport._source_provenance.verifies(
+            restored,
+            epoch=live_relay._transport.authenticated_connection_epoch,
+        )
+
+    def test_slack_snapshot_is_skipped_when_current_relay_does_not_front_slack(self):
+        live_relay = _relay_adapter()
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.RELAY: live_relay}
+        source = SessionSource.from_dict(
+            {
+                "platform": "slack",
+                "chat_id": "channel-slack",
+                "chat_type": "channel",
+                "user_id": "owner-slack",
+                "profile": "coder",
+                "transport_route": "relay",
+            }
+        )
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            restored = runner._restored_source_for_authorization(source, live_relay)
+
+        assert restored is None
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("authenticated_connection_epoch", None),
+            ("_source_provenance", None),
+        ],
+    )
+    def test_slack_snapshot_requires_live_relay_provenance(self, field, value):
+        live_relay = _relay_adapter()
+        live_relay._transport._identities = [("slack", "coder")]
+        setattr(live_relay._transport, field, value)
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner.adapters = {Platform.RELAY: live_relay}
+        source = SessionSource.from_dict(
+            {
+                "platform": "slack",
+                "chat_id": "channel-slack",
+                "chat_type": "channel",
+                "user_id": "owner-slack",
+                "profile": "coder",
+                "transport_route": "relay",
+            }
+        )
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            restored = runner._restored_source_for_authorization(source, live_relay)
+
+        assert restored is None
+
     @pytest.mark.parametrize(
         ("field", "value"),
         [

@@ -111,6 +111,8 @@ async def test_handshake_negotiates_descriptor(server):
 
 @pytest.mark.asyncio
 async def test_inbound_frame_reaches_handler(server):
+    from unittest.mock import patch
+
     server._to_push = [
         {
             "type": "inbound",
@@ -123,18 +125,33 @@ async def test_inbound_frame_reaches_handler(server):
         }
     ]
     received = []
-    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    t = WebSocketRelayTransport(
+        server.url,
+        "discord",
+        "appShared",
+        gateway_id="gateway-1",
+        upgrade_secret="secret-1",
+    )
     t.set_inbound_handler(lambda ev: received.append(ev) or asyncio.sleep(0))
-    await t.connect()
-    try:
-        await t.handshake()
-        # Give the reader a tick to deliver the pushed inbound frame.
-        await asyncio.sleep(0.05)
-        assert len(received) == 1
-        assert received[0].text == "hello from connector"
-        assert received[0].source.scope_id == "guildA"
-    finally:
-        await t.disconnect()
+    with patch.object(
+        t._source_provenance,
+        "register",
+        wraps=t._source_provenance.register,
+    ) as register:
+        await t.connect()
+        try:
+            await t.handshake()
+            # Give the reader a tick to deliver the pushed inbound frame.
+            await asyncio.sleep(0.05)
+            assert len(received) == 1
+            assert received[0].text == "hello from connector"
+            assert received[0].source.scope_id == "guildA"
+            epoch = t.authenticated_connection_epoch
+            assert epoch
+            register.assert_called_once_with(received[0].source, epoch=epoch)
+            assert t._source_provenance.verifies(received[0].source, epoch=epoch)
+        finally:
+            await t.disconnect()
 
 
 @pytest.mark.asyncio

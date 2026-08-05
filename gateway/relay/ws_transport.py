@@ -319,8 +319,9 @@ def _event_from_wire(
         # build_session_key / SessionSource.prospective_thread_id.
         prospective_thread_id=src.get("prospective_thread_id"),
     )
-    # Public routing discriminator only. Live authorization is registered by
-    # _handle_frame against the current authenticated connection epoch.
+    # Public routing discriminators only. This wire decoder owns live provenance
+    # registration against the current authenticated epoch, including direct
+    # callers; frame dispatch must not register the same source again.
     source.delivered_via_upstream_relay = True
     source.transport_route = "relay"
     epoch = getattr(transport, "authenticated_connection_epoch", None)
@@ -964,9 +965,6 @@ class WebSocketRelayTransport:
         elif ftype == "inbound":
             if self._inbound is not None:
                 event = _event_from_wire(frame.get("event", {}), transport=self)
-                epoch = self._authenticated_connection_epoch
-                if epoch is not None:
-                    self._source_provenance.register(event.source, epoch=epoch)
                 await self._inbound(event)
                 # Phase 5 §5.3: a buffered delivery (replayed on reconnect) carries
                 # a bufferId; ack it after the handler has durably taken it so the
