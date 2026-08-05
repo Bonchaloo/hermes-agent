@@ -6,7 +6,7 @@ from gateway.session import SessionSource, build_session_key
 
 
 class TestSessionSourceProfileField:
-    def test_profile_roundtrips(self):
+    def test_non_discord_chat_type_and_profile_roundtrip(self):
         s = SessionSource(
             platform=Platform.WEBHOOK if hasattr(Platform, "WEBHOOK") else Platform.TELEGRAM,
             chat_id="c1",
@@ -14,7 +14,20 @@ class TestSessionSourceProfileField:
             profile="coder",
         )
         restored = SessionSource.from_dict(s.to_dict())
+        assert restored.platform == s.platform
+        assert restored.chat_type == "webhook"
         assert restored.profile == "coder"
+
+    @pytest.mark.parametrize("chat_type", [None, 123, "", "   \t"])
+    def test_supplied_malformed_non_discord_chat_type_fails_closed(self, chat_type):
+        with pytest.raises(ValueError):
+            SessionSource.from_dict(
+                {
+                    "platform": "webhook",
+                    "chat_id": "c1",
+                    "chat_type": chat_type,
+                }
+            )
 
 
 class TestWebhookProfileResolution:

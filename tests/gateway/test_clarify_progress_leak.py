@@ -37,7 +37,9 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         return None
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
-        self.sent.append({"chat_id": chat_id, "content": content})
+        self.sent.append(
+            {"chat_id": chat_id, "content": content, "metadata": metadata}
+        )
         return SendResult(success=True, message_id="m-1")
 
     async def edit_message(self, chat_id, message_id, content) -> SendResult:
@@ -132,6 +134,7 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
 
     source = SessionSource(platform=Platform.SLACK, chat_id="C1", chat_type="dm")
 
+    generation = "04e11ff3-01bd-4636-a108-8cc9b0b23114"
     result = await runner._run_agent(
         message="hello",
         context_prompt="",
@@ -139,9 +142,16 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
         source=source,
         session_id="sess-clarify-leak",
         session_key="agent:main:slack:dm:C1",
+        response_generation=generation,
     )
 
     assert result["final_response"] == "done"
+    assert result["response_generation"] == generation
+    assert all(
+        message["metadata"]["_response_generation"] == generation
+        for message in adapter.sent
+        if message["metadata"]
+    )
     all_content = "\n".join(
         [m["content"] for m in adapter.sent] + [e["content"] for e in adapter.edits]
     )

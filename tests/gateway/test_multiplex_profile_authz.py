@@ -7,6 +7,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.session import SessionSource
+from plugins.platforms.discord.adapter import DiscordAdapter
 
 
 def _clear_auth_env(monkeypatch) -> None:
@@ -112,6 +113,35 @@ def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
     check = runner._make_adapter_auth_check(Platform.WECOM, profile_name="coder")
     assert check("some-user", "dm", "dm-chat") is True
     assert captured["profile"] == "coder"
+
+
+def test_discord_adapter_auth_check_attaches_concrete_transport(monkeypatch):
+    """Discord callback sources retain the exact adapter that observed them."""
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test"))
+    runner.adapters = {}
+    runner._profile_adapters = {"coder": {Platform.DISCORD: adapter}}
+    captured: dict = {}
+
+    def fake_is_user_authorized(source):
+        captured["source"] = source
+        return True
+
+    runner._is_user_authorized = fake_is_user_authorized
+
+    check = runner._make_adapter_auth_check(
+        Platform.DISCORD,
+        profile_name="coder",
+        adapter=adapter,
+    )
+    assert check("some-user", "dm", "dm-chat") is True
+    source = captured["source"]
+    assert source.profile == "coder"
+    assert runner._registered_transport_adapter(source) is adapter
 
 
 def test_secondary_open_policy_fails_startup_guard(monkeypatch):

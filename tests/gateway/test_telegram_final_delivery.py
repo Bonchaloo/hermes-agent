@@ -60,10 +60,11 @@ async def test_turn_final_flood_immediately_delivers_missing_tail():
 
     adapter.send.assert_awaited_once()
     assert adapter.send.await_args.kwargs["content"] == "The completed answer follows here."
-    assert adapter.send.await_args.kwargs["metadata"] == {
-        "thread_id": "77",
-        "notify": True,
-    }
+    metadata = adapter.send.await_args.kwargs["metadata"]
+    assert metadata["thread_id"] == "77"
+    assert metadata["notify"] is True
+    assert metadata["_response_generation"]
+    assert metadata["_response_generation"] == consumer.response_generation
     adapter.delete_message.assert_not_awaited()
     assert consumer.final_response_sent is True
     assert consumer.final_content_delivered is True

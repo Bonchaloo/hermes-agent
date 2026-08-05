@@ -21,6 +21,7 @@ import logging
 import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -188,7 +189,6 @@ class GatewayStreamConsumer:
     # animates a draft when the same draft_id is reused across consecutive
     # calls in the same chat, so we need a fresh non-zero id per response.
     _draft_id_counter: int = 0
-
     def __init__(
         self,
         adapter: Any,
@@ -199,11 +199,16 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        response_generation: Optional[str] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
         self.metadata = metadata
+        # Immutable, thread-safe identity for all sends from this response.
+        # A UUID avoids class-counter races when gateways construct consumers
+        # concurrently on different worker threads.
+        self._response_generation = response_generation or uuid.uuid4().hex
         # Fired whenever a fresh content bubble is created on the platform
         # (first-send of a new message, commentary, overflow chunk, or
         # fallback continuation). The gateway uses this to linearize the
@@ -333,6 +338,9 @@ class GatewayStreamConsumer:
         final-message delivery.
         """
         meta = dict(self.metadata) if self.metadata else {}
+        # Canonical private response identity. RelayAdapter consumes it for
+        # bounded semantic-thread feedback and strips it before serialization.
+        meta["_response_generation"] = self._response_generation
         if self._initial_reply_to_id:
             meta["reply_to_message_id"] = self._initial_reply_to_id
         if expect_edits:
@@ -340,6 +348,11 @@ class GatewayStreamConsumer:
         if final:
             meta["notify"] = True
         return meta or None
+
+    @property
+    def response_generation(self) -> str:
+        """Immutable identity shared by every send from this response."""
+        return self._response_generation
 
     @property
     def already_sent(self) -> bool:
@@ -1678,7 +1691,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
         except Exception as e:
             logger.debug(
@@ -1725,7 +1738,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
             if result.success:
                 self._already_sent = True
@@ -1762,7 +1775,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_send(),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1871,7 +1884,7 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self.metadata)
+                result = fn(text, metadata=self._metadata_for_send(final=True))
             except TypeError:
                 # Adapter / test double whose hook doesn't accept the metadata
                 # keyword — fall back to the positional-only form.

@@ -124,7 +124,7 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         thread_id="17585",
     )
 
-    adapter._pending_messages["agent:main:telegram:group:-1001"] = MessageEvent(
+    pending_event = MessageEvent(
         text="describe this",
         message_type=MessageType.PHOTO,
         source=pending_source,
@@ -132,7 +132,9 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         media_types=["image/png"],
         message_id="queued-1",
     )
+    adapter._pending_messages["agent:main:telegram:group:-1001"] = pending_event
 
+    first_generation = "7c5cfe12-90c9-4873-a044-bd714704a4ab"
     result = await runner._run_agent(
         message="hello",
         context_prompt="",
@@ -140,9 +142,19 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
         source=source,
         session_id="sess-native-image-followup",
         session_key="agent:main:telegram:group:-1001",
+        response_generation=first_generation,
     )
 
     assert result["final_response"] == "done-2"
+    assert result["response_generation"] == pending_event._response_generation
+    assert pending_event._response_generation != first_generation
+    assert adapter.sent[0]["metadata"]["_response_generation"] == first_generation
+    assert any(
+        item["metadata"]["_response_generation"]
+        == pending_event._response_generation
+        for item in adapter.typing
+        if item["metadata"]
+    )
     assert len(CaptureQueuedNativeImageAgent.calls) == 2
     queued_message = CaptureQueuedNativeImageAgent.calls[1]
     assert isinstance(queued_message, list)

@@ -18,11 +18,12 @@ import sys
 import tempfile
 import time
 import uuid
-import weakref
+
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from gateway.source_provenance import SourceProvenanceRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,21 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     notify_metadata = dict(metadata) if metadata else {}
     notify_metadata["notify"] = True
     return notify_metadata
+
+
+def _response_metadata_for_event(
+    event, metadata: dict | None = None, *, notify: bool = False
+) -> dict:
+    """Return canonical metadata shared by every lane of one response turn."""
+    generation = getattr(event, "_response_generation", None)
+    if not generation:
+        generation = str(uuid.uuid4())
+        event._response_generation = generation
+    response_metadata = dict(metadata or {})
+    response_metadata["_response_generation"] = generation
+    if notify:
+        response_metadata["notify"] = True
+    return response_metadata
 
 
 def _reply_anchor_for_event(event) -> str | None:
@@ -2124,6 +2140,13 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Private per-response identity. Never reconstructed from platform wire
+    # input and never serialized; adapters receive it only through internal
+    # delivery metadata (RelayAdapter consumes it before frame encoding).
+    _response_generation: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
     
@@ -2808,6 +2831,9 @@ class BasePlatformAdapter(ABC):
         # deliveries generation-aware and avoid stale runs clearing callbacks
         # registered by a fresher run for the same session.
         self._post_delivery_callbacks: Dict[str, Any] = {}
+        # Exact source-object capabilities. Copies and field mutations never
+        # inherit live adapter trust, and records disappear with their source.
+        self._source_provenance = SourceProvenanceRegistry()
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Optional authorization check, registered by GatewayRunner. Used by
@@ -5785,6 +5811,10 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        # One immutable generation id follows this user-visible response across
+        # direct, retry, split/overflow, media, and streaming delivery lanes.
+        # RelayAdapter consumes the private metadata key before wire encoding.
+        _response_metadata_for_event(event)
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
@@ -5947,7 +5977,11 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = _response_metadata_for_event(
+                    event,
+                    _thread_metadata,
+                    notify=True,
+                )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
@@ -6357,6 +6391,8 @@ class BasePlatformAdapter(ABC):
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                _thread_metadata = dict(_thread_metadata or {})
+                _thread_metadata["_response_generation"] = event._response_generation
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -6597,6 +6633,7 @@ class BasePlatformAdapter(ABC):
         role_authorized: bool = False,
         auto_thread_created: bool = False,
         auto_thread_initial_name: Optional[str] = None,
+        _profile_override: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform.
 
@@ -6610,10 +6647,16 @@ class BasePlatformAdapter(ABC):
         if chat_topic is not None and not chat_topic.strip():
             chat_topic = None
 
-        # Resolve profile from configured routes (None when no match / no routes)
-        profile = None
+        # Resolve profile atomically before provenance registration. Secondary
+        # multiplex adapters are bound to one owning profile by the scheduler;
+        # explicit call-site overrides still take precedence.
+        profile = _profile_override
+        if profile is None:
+            adapter_profile = getattr(self, "_gateway_profile_name", None)
+            if isinstance(adapter_profile, str) and adapter_profile.strip():
+                profile = adapter_profile
         runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
+        if profile is None and runner is not None:
             try:
                 profile = runner._profile_name_for_source(
                     SessionSource(
@@ -6661,10 +6704,14 @@ class BasePlatformAdapter(ABC):
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )
-        # In-process transport provenance is deliberately not serialized by
-        # SessionSource.to_dict(). The live receiving adapter is authoritative
-        # for this turn even when profile_routes selects a different runtime.
-        source._transport_adapter_ref = weakref.ref(self)
+        # In-process provenance exists only in this adapter-owned weak registry.
+        # The live receiving adapter is authoritative for this exact immutable
+        # object even when profile_routes selects a different runtime.
+        registry = getattr(self, "_source_provenance", None)
+        if registry is None:
+            registry = SourceProvenanceRegistry()
+            self._source_provenance = registry
+        registry.register(source)
         return source
     
     @abstractmethod

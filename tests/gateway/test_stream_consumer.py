@@ -9,6 +9,57 @@ import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
+def test_stream_consumer_accepts_turn_response_generation():
+    generation = "9ad13f7d-7602-4ed0-a66c-0c58cbc84fc0"
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="123",
+        response_generation=generation,
+    )
+
+    assert consumer.response_generation == generation
+
+
+@pytest.mark.asyncio
+async def test_every_stream_send_lane_carries_one_canonical_response_generation():
+    generation = "9ad13f7d-7602-4ed0-a66c-0c58cbc84fc0"
+    adapter = SimpleNamespace(
+        platform=SimpleNamespace(value="relay"),
+        MAX_MESSAGE_LENGTH=4096,
+        send=AsyncMock(
+            side_effect=[
+                SimpleNamespace(success=True, message_id="chunk"),
+                SimpleNamespace(success=True, message_id="tail"),
+                SimpleNamespace(success=True, message_id="commentary"),
+                SimpleNamespace(success=True, message_id="fallback"),
+            ]
+        ),
+    )
+
+    chunk = GatewayStreamConsumer(adapter, "chat", response_generation=generation)
+    await chunk._send_new_chunk("chunk", "anchor")
+
+    tail = GatewayStreamConsumer(adapter, "chat", response_generation=generation)
+    tail._accumulated = "tail"
+    await tail._flush_segment_tail_on_edit_failure()
+
+    commentary = GatewayStreamConsumer(
+        adapter, "chat", response_generation=generation
+    )
+    await commentary._send_commentary("commentary")
+
+    fallback = GatewayStreamConsumer(
+        adapter, "chat", response_generation=generation
+    )
+    await fallback._send_fallback_final("fallback")
+
+    assert len(adapter.send.await_args_list) == 4
+    for call in adapter.send.await_args_list:
+        metadata = call.kwargs["metadata"]
+        assert metadata["_response_generation"] == generation
+        assert "_hermes_stream_generation" not in metadata
+
+
 def test_stream_send_metadata_carries_original_reply_anchor():
     consumer = GatewayStreamConsumer(
         adapter=MagicMock(),
@@ -16,10 +67,12 @@ def test_stream_send_metadata_carries_original_reply_anchor():
         initial_reply_to_id="456",
     )
 
-    assert consumer._metadata_for_send(final=False) == {
-        "reply_to_message_id": "456",
-    }
+    metadata = consumer._metadata_for_send(final=False)
+    assert metadata is not None
+    assert metadata["reply_to_message_id"] == "456"
+    assert metadata["_response_generation"] == consumer.response_generation
     assert consumer._metadata_for_send(final=True) == {
+        "_response_generation": consumer.response_generation,
         "reply_to_message_id": "456",
         "notify": True,
     }

@@ -20,6 +20,7 @@ These tests pin the new probe ladder:
 
 from __future__ import annotations
 
+import io
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -166,6 +167,13 @@ class TestDetectAudioEnvironmentTermuxFallback:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        monkeypatch.delenv("PULSE_SERVER", raising=False)
+        monkeypatch.delenv("PIPEWIRE_REMOTE", raising=False)
+        monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
+        monkeypatch.setattr(
+            "tools.voice_mode._wsl_powershell_tts_available", lambda: False
+        )
+        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
 
         # No sounddevice — we go down the Termux:API branch.
         monkeypatch.setattr(
@@ -186,6 +194,11 @@ class TestDetectAudioEnvironmentTermuxFallback:
             "tools.voice_mode.shutil.which",
             lambda name: "/data/data/com.termux/files/usr/bin/termux-microphone-record"
             if name == "termux-microphone-record" else None,
+        )
+        monkeypatch.setattr(
+            "tools.voice_mode.open",
+            lambda *args, **kwargs: io.StringIO("Linux version 6.1.0-generic"),
+            raising=False,
         )
 
         from tools.voice_mode import detect_audio_environment

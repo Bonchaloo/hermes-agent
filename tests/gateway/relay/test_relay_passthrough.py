@@ -14,13 +14,16 @@ from __future__ import annotations
 
 import base64
 import json
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.relay.ws_transport import PassthroughForward, _passthrough_from_wire
+from gateway.run import GatewayRunner
+from gateway.source_provenance import SourceProvenanceRegistry
 
 from tests.gateway.relay.stub_connector import StubConnector
 
@@ -41,7 +44,10 @@ def _desc() -> CapabilityDescriptor:
 
 @pytest.fixture
 def adapter():
-    return RelayAdapter(PlatformConfig(), _desc(), transport=StubConnector(_desc()))
+    transport = StubConnector(_desc())
+    setattr(transport, "authenticated_connection_epoch", "passthrough-epoch")
+    setattr(transport, "_source_provenance", SourceProvenanceRegistry())
+    return RelayAdapter(PlatformConfig(), _desc(), transport=transport)
 
 
 def _interaction_forward(payload: dict) -> PassthroughForward:
@@ -121,8 +127,135 @@ async def test_discord_interaction_routes_through_handle_message(adapter, monkey
     assert ev.source.scope_id == "guild-7"
     assert ev.source.user_id == "user-3"
     assert ev.source.chat_type == "channel"
+    assert ev.source.platform == Platform.DISCORD
     # Scope captured so the agent's reply re-asserts scope_id for egress.
     assert adapter._scope_by_chat.get("chan-9") == "guild-7"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_passthrough_transport_reaches_runner_authorized(adapter, monkeypatch):
+    for name in (
+        "DISCORD_ALLOWED_USERS",
+        "DISCORD_ALLOWED_ROLES",
+        "DISCORD_ALLOWED_CHANNELS",
+        "DISCORD_IGNORED_CHANNELS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.adapters = {Platform.RELAY: adapter}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    decisions = []
+
+    async def authorize_at_runner(event):
+        decisions.append(runner._is_user_authorized(event.source))
+
+    adapter.handle_message = authorize_at_runner
+    await adapter.connect()
+    await adapter._transport.push_passthrough(
+        _interaction_forward(
+            {
+                "id": "interaction-auth",
+                "type": 2,
+                "channel_id": "chan-auth",
+                "guild_id": "guild-auth",
+                "data": {"name": "status"},
+                "member": {"user": {"id": "owner-auth", "username": "owner"}},
+            }
+        )
+    )
+
+    assert decisions == [True]
+
+
+@pytest.mark.asyncio
+async def test_passthrough_without_live_epoch_is_denied_before_dispatch(monkeypatch):
+    transport = StubConnector(_desc())
+    setattr(transport, "authenticated_connection_epoch", None)
+    setattr(transport, "_source_provenance", SourceProvenanceRegistry())
+    relay = RelayAdapter(PlatformConfig(), _desc(), transport=transport)
+    handle_message = AsyncMock()
+    relay.handle_message = handle_message
+    await relay.connect()
+
+    await transport.push_passthrough(
+        _interaction_forward(
+            {
+                "id": "interaction-no-epoch",
+                "type": 2,
+                "channel_id": "chan-auth",
+                "guild_id": "guild-auth",
+                "data": {"name": "status"},
+                "member": {"user": {"id": "owner-auth"}},
+            }
+        )
+    )
+
+    handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_without_provenance_registry_is_denied_before_dispatch():
+    transport = StubConnector(_desc())
+    setattr(transport, "authenticated_connection_epoch", "live-epoch")
+    relay = RelayAdapter(PlatformConfig(), _desc(), transport=transport)
+    handle_message = AsyncMock()
+    relay.handle_message = handle_message
+    await relay.connect()
+
+    await transport.push_passthrough(
+        _interaction_forward(
+            {
+                "id": "interaction-no-registry",
+                "type": 2,
+                "channel_id": "chan-auth",
+                "guild_id": "guild-auth",
+                "data": {"name": "status"},
+                "member": {"user": {"id": "owner-auth"}},
+            }
+        )
+    )
+
+    handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_passthrough_stale_epoch_is_denied_at_runner(adapter, monkeypatch):
+    for name in (
+        "DISCORD_ALLOWED_USERS",
+        "DISCORD_ALLOWED_ROLES",
+        "DISCORD_ALLOWED_CHANNELS",
+        "DISCORD_IGNORED_CHANNELS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.adapters = {Platform.RELAY: adapter}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    decisions = []
+
+    async def stale_before_authorization(event):
+        setattr(adapter._transport, "authenticated_connection_epoch", "next-epoch")
+        decisions.append(runner._is_user_authorized(event.source))
+
+    adapter.handle_message = stale_before_authorization
+    await adapter.connect()
+    await adapter._transport.push_passthrough(
+        _interaction_forward(
+            {
+                "id": "interaction-stale",
+                "type": 2,
+                "channel_id": "chan-auth",
+                "guild_id": "guild-auth",
+                "data": {"name": "status"},
+                "member": {"user": {"id": "owner-auth"}},
+            }
+        )
+    )
+
+    assert decisions == [False]
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Iterable, Optional, Tuple
 
@@ -66,10 +67,34 @@ def find_git_worktree(start: str) -> Optional[str]:
         return root
 
     cur = start_path
+    try:
+        # Match the same lexical normalization used for ``start_path``.  Do
+        # not resolve symlinks here: workspace identity deliberately keeps
+        # the path spelling supplied by the caller.
+        temp_root = Path(normalize_path(tempfile.gettempdir()))
+    except (OSError, RuntimeError, ValueError):
+        temp_root = None
     # Defensive cap: the deepest reasonable monorepo is well under 64
     # levels.  Caps the walk so a pathological cwd or a symlink cycle
     # we somehow traverse can't keep us looping.
     for _ in range(64):
+        # A shared system temp directory is an isolation boundary, not a
+        # project root.  Stop here rather than continuing to ambient parents:
+        # test runners commonly create workspaces below it, and a stray
+        # /tmp/.git must not activate LSP for every temporary file.
+        if temp_root is not None:
+            at_temp_boundary = cur == temp_root
+            if not at_temp_boundary:
+                try:
+                    # macOS commonly exposes the same temp directory through
+                    # both /var/... and /private/var/... spellings. Compare
+                    # filesystem identity only for this isolation boundary;
+                    # returned workspace paths remain lexical.
+                    at_temp_boundary = cur.samefile(temp_root)
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            if at_temp_boundary:
+                break
         git_marker = cur / ".git"
         try:
             if git_marker.exists():

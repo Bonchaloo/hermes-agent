@@ -111,6 +111,8 @@ async def test_handshake_negotiates_descriptor(server):
 
 @pytest.mark.asyncio
 async def test_inbound_frame_reaches_handler(server):
+    from unittest.mock import patch
+
     server._to_push = [
         {
             "type": "inbound",
@@ -123,18 +125,437 @@ async def test_inbound_frame_reaches_handler(server):
         }
     ]
     received = []
-    t = WebSocketRelayTransport(server.url, "discord", "appShared")
+    t = WebSocketRelayTransport(
+        server.url,
+        "discord",
+        "appShared",
+        gateway_id="gateway-1",
+        upgrade_secret="secret-1",
+    )
     t.set_inbound_handler(lambda ev: received.append(ev) or asyncio.sleep(0))
-    await t.connect()
+    with patch.object(
+        t._source_provenance,
+        "register",
+        wraps=t._source_provenance.register,
+    ) as register:
+        await t.connect()
+        try:
+            await t.handshake()
+            # Give the reader a tick to deliver the pushed inbound frame.
+            await asyncio.sleep(0.05)
+            assert len(received) == 1
+            assert received[0].text == "hello from connector"
+            assert received[0].source.scope_id == "guildA"
+            epoch = t.authenticated_connection_epoch
+            assert epoch
+            register.assert_called_once_with(received[0].source, epoch=epoch)
+            assert t._source_provenance.verifies(received[0].source, epoch=epoch)
+        finally:
+            await t.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_authenticated_epoch_changes_and_stale_sources_are_revoked(server):
+    from unittest.mock import MagicMock
+
+    from gateway.config import Platform, PlatformConfig
+    from gateway.relay.adapter import RelayAdapter
+    from gateway.relay.descriptor import CapabilityDescriptor
+    from gateway.run import GatewayRunner
+
+    server._to_push = [
+        {
+            "type": "inbound",
+            "event": {
+                "text": "epoch event",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "chan-epoch",
+                    "chat_type": "group",
+                    "user_id": "owner-epoch",
+                    "scope_id": "guild-epoch",
+                },
+            },
+        }
+    ]
+    received = []
+    transport = WebSocketRelayTransport(
+        server.url,
+        "discord",
+        "appShared",
+        gateway_id="gateway-1",
+        upgrade_secret="secret-1",
+    )
+    transport.set_inbound_handler(
+        lambda event: received.append(event) or asyncio.sleep(0)
+    )
+    adapter = RelayAdapter(
+        PlatformConfig(enabled=True),
+        descriptor=CapabilityDescriptor.from_json(json.dumps(DESCRIPTOR)),
+        transport=transport,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: adapter}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+
+    await transport.connect()
     try:
-        await t.handshake()
-        # Give the reader a tick to deliver the pushed inbound frame.
-        await asyncio.sleep(0.05)
-        assert len(received) == 1
-        assert received[0].text == "hello from connector"
-        assert received[0].source.scope_id == "guildA"
+        await transport.handshake()
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        first_source = received[-1].source
+        first_epoch = transport.authenticated_connection_epoch
+        assert first_epoch
+        assert runner._is_user_authorized(first_source) is True
+
+        await transport.disconnect()
+        assert transport.authenticated_connection_epoch is None
+        assert runner._is_user_authorized(first_source) is False
+
+        received.clear()
+        await transport.connect()
+        await transport.handshake()
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        second_source = received[-1].source
+        assert transport.authenticated_connection_epoch
+        assert transport.authenticated_connection_epoch != first_epoch
+        assert runner._is_user_authorized(first_source) is False
+        assert runner._is_user_authorized(second_source) is True
     finally:
-        await t.disconnect()
+        await transport.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_frame",
+    [
+        [],
+        {"type": "inbound", "event": []},
+        {"type": "inbound", "event": {"source": []}},
+        {
+            "type": "inbound",
+            "event": {
+                "text": "bad reply",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "bad",
+                    "chat_type": "group",
+                },
+                "reply_to": [],
+            },
+        },
+        {
+            "type": "inbound",
+            "event": {
+                "text": "bad platform",
+                "message_type": "text",
+                "source": {
+                    "platform": [],
+                    "chat_id": "bad",
+                    "chat_type": "group",
+                },
+            },
+        },
+        {
+            "type": "inbound",
+            "event": {
+                "text": "bad type",
+                "message_type": [],
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "bad",
+                    "chat_type": "group",
+                },
+            },
+        },
+        {
+            "type": "inbound",
+            "event": {
+                "text": "bad metadata",
+                "message_type": "text",
+                "metadata": [],
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "bad",
+                    "chat_type": "group",
+                },
+            },
+        },
+    ],
+    ids=(
+        "frame",
+        "event",
+        "source",
+        "reply_to",
+        "platform",
+        "message_type",
+        "metadata",
+    ),
+)
+async def test_malformed_inbound_is_dropped_without_ending_current_reader(
+    server,
+    bad_frame,
+):
+    """Every malformed event is isolated; the next frame uses the same socket."""
+    valid = {
+        "type": "inbound",
+        "event": {
+            "text": "valid after malformed",
+            "message_type": "text",
+            "source": {
+                "platform": "discord",
+                "chat_id": "good",
+                "chat_type": "group",
+            },
+        },
+    }
+    server._to_push = [bad_frame, valid]
+    received = []
+    transport = WebSocketRelayTransport(server.url, "discord", "appShared")
+    transport.set_inbound_handler(
+        lambda event: received.append(event) or asyncio.sleep(0)
+    )
+
+    await transport.connect()
+    try:
+        await transport.handshake()
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        assert [event.text for event in received] == ["valid after malformed"]
+        assert transport._reader is not None and not transport._reader.done()
+    finally:
+        await transport.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_source",
+    [
+        {"platform": "webhook", "chat_id": "bad"},
+        {"platform": "webhook", "chat_id": "bad", "chat_type": None},
+        {"platform": "webhook", "chat_id": "bad", "chat_type": 7},
+        {"platform": "webhook", "chat_id": "bad", "chat_type": ""},
+        {"platform": "webhook", "chat_id": "bad", "chat_type": "   \t"},
+    ],
+    ids=("missing", "none", "non-string", "empty", "whitespace"),
+)
+async def test_non_discord_chat_type_boundary_isolates_bad_event_then_dispatches_valid(
+    server,
+    bad_source,
+):
+    """Every platform requires an explicit nonempty string, not Discord's enum."""
+    server._to_push = [
+        {
+            "type": "inbound",
+            "event": {
+                "text": "malformed webhook",
+                "message_type": "text",
+                "source": bad_source,
+            },
+        },
+        {
+            "type": "inbound",
+            "event": {
+                "text": "valid webhook",
+                "message_type": "text",
+                "source": {
+                    "platform": "webhook",
+                    "chat_id": "good",
+                    "chat_type": "webhook",
+                },
+            },
+        },
+    ]
+    received = []
+    transport = WebSocketRelayTransport(server.url, "discord", "appShared")
+    transport.set_inbound_handler(
+        lambda event: received.append(event) or asyncio.sleep(0)
+    )
+
+    await transport.connect()
+    try:
+        await transport.handshake()
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        assert [event.text for event in received] == ["valid webhook"]
+        assert received[0].source.chat_type == "webhook"
+        assert transport._reader is not None and not transport._reader.done()
+    finally:
+        await transport.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_discord_chat_type_outside_closed_set_isolated_from_next_event(server):
+    server._to_push = [
+        {
+            "type": "inbound",
+            "event": {
+                "text": "bad Discord type",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "bad",
+                    "chat_type": "webhook",
+                },
+            },
+        },
+        {
+            "type": "inbound",
+            "event": {
+                "text": "valid Discord type",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "good",
+                    "chat_type": "channel",
+                },
+            },
+        },
+    ]
+    received = []
+    transport = WebSocketRelayTransport(server.url, "discord", "appShared")
+    transport.set_inbound_handler(
+        lambda event: received.append(event) or asyncio.sleep(0)
+    )
+
+    await transport.connect()
+    try:
+        await transport.handshake()
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        assert [event.text for event in received] == ["valid Discord type"]
+        assert transport._reader is not None and not transport._reader.done()
+    finally:
+        await transport.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guild_id", ["guild-name", "123456789012345678"])
+async def test_relay_deprecated_guild_alias_falls_back_to_scope(server, guild_id):
+    server._to_push = [
+        {
+            "type": "inbound",
+            "event": {
+                "text": "legacy guild alias",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "channel-1",
+                    "chat_type": "channel",
+                    "scope_id": None,
+                    "guild_id": guild_id,
+                },
+            },
+        }
+    ]
+    received = []
+    transport = WebSocketRelayTransport(server.url, "discord", "appShared")
+    transport.set_inbound_handler(
+        lambda event: received.append(event) or asyncio.sleep(0)
+    )
+
+    await transport.connect()
+    try:
+        await transport.handshake()
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        assert len(received) == 1
+        assert received[0].source.scope_id == guild_id
+        assert received[0].source.guild_id == guild_id
+    finally:
+        await transport.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad_aliases",
+    [
+        {"scope_id": "guild-name", "guild_id": []},
+        {"scope_id": "guild-name", "guild_id": ""},
+        {"scope_id": "guild-name", "guild_id": "   \t"},
+        {"scope_id": "guild-name", "guild_id": "other-guild"},
+        {"scope_id": [], "guild_id": "guild-name"},
+        {"scope_id": "", "guild_id": "guild-name"},
+        {"scope_id": "   \t", "guild_id": "guild-name"},
+    ],
+    ids=(
+        "malformed-guild",
+        "empty-guild",
+        "whitespace-guild",
+        "conflicting-guild",
+        "malformed-scope",
+        "empty-scope",
+        "whitespace-scope",
+    ),
+)
+async def test_relay_alias_boundary_isolates_bad_event_then_dispatches_valid(
+    server,
+    bad_aliases,
+):
+    server._to_push = [
+        {
+            "type": "inbound",
+            "event": {
+                "text": "bad aliases",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "bad",
+                    "chat_type": "channel",
+                    **bad_aliases,
+                },
+            },
+        },
+        {
+            "type": "inbound",
+            "event": {
+                "text": "valid aliases",
+                "message_type": "text",
+                "source": {
+                    "platform": "discord",
+                    "chat_id": "good",
+                    "chat_type": "channel",
+                    "scope_id": "123456789012345678",
+                    "guild_id": "123456789012345678",
+                },
+            },
+        },
+    ]
+    received = []
+    transport = WebSocketRelayTransport(server.url, "discord", "appShared")
+    transport.set_inbound_handler(
+        lambda event: received.append(event) or asyncio.sleep(0)
+    )
+
+    await transport.connect()
+    try:
+        await transport.handshake()
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.01)
+        assert [event.text for event in received] == ["valid aliases"]
+        assert received[0].source.scope_id == "123456789012345678"
+        assert received[0].source.guild_id == "123456789012345678"
+        assert transport._reader is not None and not transport._reader.done()
+    finally:
+        await transport.disconnect()
 
 
 # ── Phase 7 Unit 7d-B: terminal 4401 (opt-out revocation) ────────────────────

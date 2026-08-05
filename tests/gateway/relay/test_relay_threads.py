@@ -18,6 +18,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import re
 from typing import Any, Dict
 
@@ -28,6 +29,7 @@ from gateway.relay.adapter import RelayAdapter
 from gateway.relay.command_manifest import build_relay_command_manifest
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.relay.ws_transport import _event_from_wire
+from gateway.stream_consumer import GatewayStreamConsumer
 
 from tests.gateway.relay.stub_connector import StubConnector
 
@@ -38,6 +40,8 @@ FULL_OPS = (
     "get_chat_info",
     "thread_create",
     "thread_rename",
+    "send_media",
+    "prompt",
 )
 
 
@@ -279,8 +283,323 @@ async def test_send_without_thread_feedback_leaves_no_info():
         return {"success": True, "message_id": "m2"}
 
     stub.send_outbound = send_outbound  # type: ignore[method-assign]
-    adapter._auto_thread_by_chat[("chan2", "msg-2")] = ("stale", "Old")
     await adapter.send("chan2", "hello", reply_to="msg-2")
+    assert adapter.auto_thread_info_for_chat("chan2", "msg-2") is None
+
+
+def test_stream_consumer_scopes_relay_feedback_generation_per_response():
+    adapter, _stub = _adapter()
+    first = GatewayStreamConsumer(adapter, "chan2")
+    second = GatewayStreamConsumer(adapter, "chan2")
+
+    first_generation = first._metadata_for_send()["_response_generation"]
+    assert first._metadata_for_send()["_response_generation"] == first_generation
+    assert second._metadata_for_send()["_response_generation"] != first_generation
+
+
+@pytest.mark.asyncio
+async def test_canonical_generation_drives_feedback_and_never_reaches_wire():
+    adapter, stub = _adapter()
+    stub.next_send_result = {
+        "success": True,
+        "message_id": "m-generation",
+        "thread_id": "thread-generation",
+        "auto_thread_name": "Initial generation title",
+    }
+
+    await adapter.send(
+        "chan2",
+        "hello",
+        reply_to="trigger",
+        metadata={
+            "_response_generation": "generation-1",
+            "_relay_logical_platform": "discord",
+            "visible": "yes",
+        },
+    )
+
+    assert stub.sent[-1]["metadata"] == {"visible": "yes"}
+    assert stub.sent_platforms[-1] == "discord"
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "trigger", response_generation="generation-1"
+    ) == ("thread-generation", "Initial generation title")
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "trigger", response_generation="generation-1"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_same_anchor_generations_are_isolated_and_feedback_cache_is_bounded():
+    adapter, stub = _adapter()
+
+    async def send_outbound(action, *, platform=None):
+        generation = action["content"]
+        return {
+            "success": True,
+            "message_id": f"message-{generation}",
+            "thread_id": f"thread-{generation}",
+            "auto_thread_name": f"title-{generation}",
+        }
+
+    stub.send_outbound = send_outbound  # type: ignore[method-assign]
+    for index in range(300):
+        generation = f"generation-{index}"
+        await adapter.send(
+            "same-chat",
+            generation,
+            reply_to="same-anchor",
+            metadata={"_response_generation": generation},
+        )
+
+    assert adapter.auto_thread_info_for_chat(
+        "same-chat", "same-anchor", response_generation="generation-0"
+    ) is None
+    assert adapter.auto_thread_info_for_chat(
+        "same-chat", "same-anchor", response_generation="generation-299"
+    ) == ("thread-generation-299", "title-generation-299")
+    assert adapter.auto_thread_info_for_chat(
+        "same-chat", "same-anchor", response_generation="generation-299"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_anchor_feedback_is_generation_scoped_consume_once_and_bounded():
+    adapter, stub = _adapter()
+
+    async def send_one(index: int):
+        generation = f"concurrent-{index}"
+
+        async def send_outbound(action, *, platform=None):
+            stub.sent.append(action)
+            return {
+                "success": True,
+                "message_id": f"message-{index}",
+                "thread_id": f"thread-{index}",
+                "auto_thread_name": f"title-{index}",
+            }
+
+        original = stub.send_outbound
+        stub.send_outbound = send_outbound  # type: ignore[method-assign]
+        try:
+            await adapter.send(
+                "same-chat",
+                f"response-{index}",
+                reply_to="same-anchor",
+                metadata={"_response_generation": generation},
+            )
+        finally:
+            stub.send_outbound = original  # type: ignore[method-assign]
+        return generation
+
+    # The production cache stays bounded even when many responses share one anchor.
+    generations = []
+    for index in range(300):
+        generations.append(await send_one(index))
+    assert len(adapter._auto_thread_by_chat) <= 256
+
+    generation = generations[-1]
+    consumed = await asyncio.gather(
+        *[
+            asyncio.to_thread(
+                adapter.auto_thread_info_for_chat,
+                "same-chat",
+                "same-anchor",
+                response_generation=generation,
+            )
+            for _ in range(16)
+        ]
+    )
+    assert consumed.count(("thread-299", "title-299")) == 1
+    assert consumed.count(None) == 15
+
+
+@pytest.mark.asyncio
+async def test_every_relay_metadata_egress_strips_private_keys_behaviorally():
+    adapter, stub = _adapter()
+    private_metadata = {
+        "_response_generation": "canonical",
+        "_hermes_stream_generation": "legacy",
+        "_future_private": "must-not-leak",
+        "visible": "yes",
+    }
+
+    await adapter.send("chat", "send", metadata=private_metadata)
+    await adapter.send_for_platform(
+        Platform.DISCORD, "chat", "explicit", metadata=private_metadata
+    )
+    await adapter.edit_message("chat", "message", "edit", metadata=private_metadata)
+    await adapter.send_typing("chat", metadata=private_metadata)
+    await adapter._send_media(
+        "chat",
+        media_kind="image",
+        source="https://example.test/image.png",
+        source_is_path=False,
+        metadata=private_metadata,
+    )
+    await adapter._send_prompt(
+        "chat",
+        prompt_kind="clarify",
+        text="pick",
+        prompt_id="prompt-id",
+        options=[],
+        metadata=private_metadata,
+    )
+    await adapter.send_follow_up(
+        "session", "discord.interaction_token", "follow up", private_metadata
+    )
+
+    serialized = [*stub.sent, *stub.follow_ups]
+    assert {action["op"] for action in serialized} >= {
+        "send",
+        "edit",
+        "typing",
+        "send_media",
+        "prompt",
+        "follow_up",
+    }
+    for action in serialized:
+        assert action["metadata"].get("visible") == "yes"
+        assert not any(key.startswith("_") for key in action["metadata"])
+
+
+@pytest.mark.asyncio
+async def test_split_send_preserves_first_auto_thread_feedback_until_consumed():
+    adapter, stub = _adapter()
+    results = iter([
+        {
+            "success": True,
+            "message_id": "chunk-1",
+            "thread_id": "th-split",
+            "auto_thread_name": "Initial split title",
+        },
+        {"success": True, "message_id": "chunk-2"},
+    ])
+
+    async def send_outbound(action, *, platform=None):
+        stub.sent.append(action)
+        return next(results)
+
+    stub.send_outbound = send_outbound  # type: ignore[method-assign]
+    generation = {"_hermes_stream_generation": 7}
+    await adapter.send("chan2", "first", reply_to="msg-2", metadata=generation)
+    await adapter.send("chan2", "second", reply_to="msg-2", metadata=generation)
+
+    assert all(
+        "_hermes_stream_generation" not in action["metadata"]
+        for action in stub.sent
+    )
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "msg-2", response_generation="7"
+    ) == (
+        "th-split",
+        "Initial split title",
+    )
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "msg-2", response_generation="7"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_no_feedback_generation_does_not_steal_other_generation():
+    adapter, stub = _adapter()
+    results = iter([
+        {
+            "success": True,
+            "message_id": "chunk-1",
+            "thread_id": "th-stale",
+            "auto_thread_name": "Stale title",
+        },
+        {"success": True, "message_id": "chunk-2"},
+    ])
+
+    async def send_outbound(action, *, platform=None):
+        return next(results)
+
+    stub.send_outbound = send_outbound  # type: ignore[method-assign]
+    await adapter.send(
+        "chan2",
+        "first response",
+        reply_to="msg-2",
+        metadata={"_hermes_stream_generation": 7},
+    )
+    await adapter.send(
+        "chan2",
+        "later response",
+        reply_to="msg-2",
+        metadata={"_hermes_stream_generation": 8},
+    )
+
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "msg-2", response_generation="8"
+    ) is None
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "msg-2", response_generation="7"
+    ) == ("th-stale", "Stale title")
+
+
+@pytest.mark.asyncio
+async def test_positive_feedback_is_isolated_by_response_generation():
+    adapter, stub = _adapter()
+    results = iter(
+        [
+            {
+                "success": True,
+                "thread_id": "thread-A",
+                "auto_thread_name": "A",
+            },
+            {
+                "success": True,
+                "thread_id": "thread-B",
+                "auto_thread_name": "B",
+            },
+        ]
+    )
+
+    async def send_outbound(_action, *, platform=None):
+        return next(results)
+
+    stub.send_outbound = send_outbound  # type: ignore[method-assign]
+    await adapter.send(
+        "chan2",
+        "response A",
+        reply_to="msg-2",
+        metadata={"_hermes_stream_generation": "gen-A"},
+    )
+    await adapter.send(
+        "chan2",
+        "response B",
+        reply_to="msg-2",
+        metadata={"_hermes_stream_generation": "gen-B"},
+    )
+
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "msg-2", response_generation="gen-A"
+    ) == ("thread-A", "A")
+    assert adapter.auto_thread_info_for_chat(
+        "chan2", "msg-2", response_generation="gen-B"
+    ) == ("thread-B", "B")
+
+
+@pytest.mark.asyncio
+async def test_ungenerated_retry_clears_stale_auto_thread_feedback():
+    adapter, stub = _adapter()
+    results = iter([
+        {
+            "success": True,
+            "message_id": "chunk-1",
+            "thread_id": "th-stale",
+            "auto_thread_name": "Stale title",
+        },
+        {"success": True, "message_id": "chunk-2"},
+    ])
+
+    async def send_outbound(action, *, platform=None):
+        return next(results)
+
+    stub.send_outbound = send_outbound  # type: ignore[method-assign]
+    await adapter.send("chan2", "first response", reply_to="msg-2")
+    await adapter.send("chan2", "retry", reply_to="msg-2")
+
     assert adapter.auto_thread_info_for_chat("chan2", "msg-2") is None
 
 
@@ -461,7 +780,7 @@ async def test_title_rename_polls_feedback_that_arrives_late():
 
     async def land_feedback_late():
         await asyncio.sleep(0.7)  # past the first poll tick
-        adapter._auto_thread_by_chat[("chan-parent", "msg-current")] = (
+        adapter._auto_thread_by_chat[("chan-parent", "msg-current", "")] = (
             "th-9",
             "Initial words",
         )
@@ -503,7 +822,7 @@ async def test_title_rename_ignores_stale_feedback_from_prior_message():
         return True
 
     adapter.rename_thread = rename_thread  # type: ignore[method-assign]
-    adapter._auto_thread_by_chat[("chan-parent", "msg-old")] = (
+    adapter._auto_thread_by_chat[("chan-parent", "msg-old", "")] = (
         "th-stale",
         "Old title",
     )
@@ -513,7 +832,7 @@ async def test_title_rename_ignores_stale_feedback_from_prior_message():
 
     async def land_current_feedback():
         await asyncio.sleep(0.7)
-        adapter._auto_thread_by_chat[("chan-parent", "msg-current")] = (
+        adapter._auto_thread_by_chat[("chan-parent", "msg-current", "")] = (
             "th-current",
             "Current initial title",
         )

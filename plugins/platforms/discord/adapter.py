@@ -4534,8 +4534,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 pass
 
     def _discord_channel_ids_allowed(self, channel_ids: set[str]) -> bool:
-        """True when *channel_ids* intersect ``DISCORD_ALLOWED_CHANNELS``."""
+        """True when *channel_ids* pass this adapter's channel gates.
+
+        ``DISCORD_IGNORED_CHANNELS`` is an explicit deny and wins even when the
+        same channel (or its parent) is also allowed, matching normal intake.
+        """
         if not channel_ids:
+            return False
+        if self._discord_channel_ids_ignored(channel_ids):
             return False
         allowed = self._get_allowed_channels()
         if not allowed:
@@ -4543,6 +4549,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if "*" in allowed:
             return True
         return bool(channel_ids & allowed)
+
+    def _discord_channel_ids_ignored(self, channel_ids: set[str]) -> bool:
+        """True when Discord's explicit deny policy matches *channel_ids*."""
+        if not channel_ids:
+            return False
+        ignored = self._get_ignored_channels()
+        return bool(ignored and ("*" in ignored or bool(channel_ids & ignored)))
 
     def _is_pairing_approved_user(self, user_id: str) -> bool:
         """True when the Discord user has an explicit Hermes pairing grant."""

@@ -25,13 +25,20 @@ depends on), not a snapshot. They drive the REAL ``RelayAdapter`` +
 
 from __future__ import annotations
 
+import copy
+import json
+from unittest.mock import MagicMock
+
 import pytest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
+from gateway.relay.ws_transport import WebSocketRelayTransport, _event_from_wire
+from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from gateway.source_provenance import SourceProvenanceRegistry
 
 from tests.gateway.relay.stub_connector import StubConnector
 
@@ -354,11 +361,438 @@ def _inbound_event(chat_id="D1", message_id="1700.0100", thread_id=None):
     )
 
 
+def _authenticated_stack(epoch="authenticated-current"):
+    transport = WebSocketRelayTransport(
+        "wss://relay.invalid/ws",
+        "slack",
+        "B1",
+        gateway_id="gateway-1",
+        upgrade_secret="secret-1",
+    )
+    transport._authenticated_connection_epoch = epoch
+    adapter = RelayAdapter(
+        PlatformConfig(enabled=True),
+        _slack_desc(),
+        transport=transport,
+    )
+    transport.set_inbound_handler(adapter._on_inbound)
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: adapter}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+    return transport, adapter, runner
+
+
+def _wire_top_level_dm(
+    transport=None,
+    *,
+    message_id="1700.0100",
+    thread_id=None,
+):
+    source = {
+        "platform": "slack",
+        "chat_id": "D1",
+        "chat_type": "dm",
+        "user_id": "U1",
+        "scope_id": "T1",
+    }
+    if thread_id is not None:
+        source["thread_id"] = thread_id
+    return _event_from_wire(
+        {
+            "text": "hello",
+            "message_type": "text",
+            "message_id": message_id,
+            "source": source,
+        },
+        transport=transport,
+    )
+
+
+async def _authorize_through_relay_ingress(adapter, runner, event):
+    verdicts = []
+
+    async def authorize(normalized_event):
+        verdicts.append(runner._is_user_authorized(normalized_event.source))
+
+    adapter.handle_message = authorize
+    await adapter._on_inbound(event)
+    assert len(verdicts) == 1
+    return verdicts[0]
+
+
 def test_top_level_dm_gets_session_thread_stamp():
     adapter, _ = _wire("D1", "dm")
     ev = _inbound_event(message_id="1700.0100")
     adapter._stamp_slack_session_thread(ev)
     assert ev.source.thread_id == "1700.0100"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_top_level_dm_survives_ingress_normalization_and_authorization():
+    """Production order stays authorized: transport register -> Slack stamp -> runner."""
+    transport = WebSocketRelayTransport(
+        "wss://relay.invalid/ws",
+        "slack",
+        "B1",
+        gateway_id="gateway-1",
+        upgrade_secret="secret-1",
+    )
+    adapter = RelayAdapter(
+        PlatformConfig(enabled=True),
+        _slack_desc(),
+        transport=transport,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.RELAY: adapter}
+    runner._profile_adapters = {}
+    runner.pairing_store = MagicMock()
+
+    observed = {}
+
+    async def authorize_after_normalization(event):
+        epoch = transport.authenticated_connection_epoch
+        observed["thread_id"] = event.source.thread_id
+        observed["verified"] = transport._source_provenance.verifies(
+            event.source,
+            epoch=epoch,
+        )
+        observed["authorized"] = runner._is_user_authorized(event.source)
+
+    adapter.handle_message = authorize_after_normalization
+    transport.set_inbound_handler(adapter._on_inbound)
+    await transport._handle_frame(
+        json.dumps(
+            {
+                "type": "descriptor",
+                "descriptor": json.loads(_slack_desc().to_json()),
+            }
+        )
+    )
+    assert transport.authenticated_connection_epoch
+
+    await transport._handle_frame(
+        json.dumps(
+            {
+                "type": "inbound",
+                "event": {
+                    "text": "hello",
+                    "message_type": "text",
+                    "message_id": "1700.0100",
+                    "source": {
+                        "platform": "slack",
+                        "chat_id": "D1",
+                        "chat_type": "dm",
+                        "user_id": "U1",
+                        "scope_id": "T1",
+                    },
+                },
+            }
+        )
+    )
+
+    assert observed["thread_id"] == "1700.0100"
+    assert observed["verified"] is True
+    assert observed["authorized"] is True
+
+
+@pytest.mark.asyncio
+async def test_unregistered_wire_source_is_not_resealed_and_denies():
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(None)
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_forged_relay_marker_is_not_resealed_and_denies():
+    transport, adapter, runner = _authenticated_stack()
+    event = _inbound_event()
+    event.source.delivered_via_upstream_relay = True
+    event.source.transport_route = "relay"
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_copied_registered_source_is_not_resealed_and_denies():
+    transport, adapter, runner = _authenticated_stack()
+    registered = _wire_top_level_dm(transport)
+    event = copy.copy(registered)
+    event.source = copy.copy(registered.source)
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_epoch_source_is_not_resealed_and_denies():
+    transport, adapter, runner = _authenticated_stack("authenticated-old")
+    event = _wire_top_level_dm(transport)
+    transport._authenticated_connection_epoch = "authenticated-current"
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_absent_epoch_source_is_not_resealed_and_denies():
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+    transport._authenticated_connection_epoch = None
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(event.source, epoch=None)
+
+
+@pytest.mark.asyncio
+async def test_already_mutated_source_is_not_resealed_and_denies():
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+    event.source.user_id = "forged-user"
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_registered_by_different_transport_is_not_resealed_and_denies():
+    owner_transport, _owner_adapter, _owner_runner = _authenticated_stack()
+    event = _wire_top_level_dm(owner_transport)
+    foreign_transport, foreign_adapter, foreign_runner = _authenticated_stack()
+
+    assert (
+        await _authorize_through_relay_ingress(
+            foreign_adapter,
+            foreign_runner,
+            event,
+        )
+        is False
+    )
+    assert event.source.thread_id == "1700.0100"
+    assert not foreign_transport._source_provenance.verifies(
+        event.source,
+        epoch=foreign_transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_normalized_by_wrong_adapter_on_same_transport_denies():
+    transport, owner_adapter, owner_runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+    wrong_adapter = RelayAdapter(
+        PlatformConfig(enabled=True),
+        _slack_desc(),
+        transport=transport,
+    )
+
+    assert transport._inbound == owner_adapter._on_inbound
+    assert (
+        await _authorize_through_relay_ingress(
+            wrong_adapter,
+            owner_runner,
+            event,
+        )
+        is False
+    )
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_epoch_change_during_normalization_prevents_reseal_and_denies():
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+    stamp = adapter._stamp_slack_session_thread
+
+    def stamp_after_epoch_change(event):
+        transport._authenticated_connection_epoch = "authenticated-replaced"
+        stamp(event)
+
+    adapter._stamp_slack_session_thread = stamp_after_epoch_change
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_registry_change_during_normalization_prevents_reseal_and_denies():
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+    stamp = adapter._stamp_slack_session_thread
+    replacement_registry = SourceProvenanceRegistry()
+
+    def stamp_after_registry_change(event):
+        transport._source_provenance = replacement_registry
+        stamp(event)
+
+    adapter._stamp_slack_session_thread = stamp_after_registry_change
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    assert not replacement_registry.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+
+@pytest.mark.asyncio
+async def test_callback_replacement_during_normalization_prevents_reseal_and_denies(
+    monkeypatch,
+):
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+    registry = transport._source_provenance
+    epoch = transport.authenticated_connection_epoch
+
+    assert getattr(transport._inbound, "__self__", None) is adapter
+    assert getattr(transport._inbound, "__func__", None) is adapter._on_inbound.__func__
+    assert registry.verifies(event.source, epoch=epoch)
+    assert runner._is_user_authorized(event.source) is True
+
+    register = MagicMock(wraps=registry.register)
+    monkeypatch.setattr(registry, "register", register)
+    stamp = adapter._stamp_slack_session_thread
+
+    async def replacement_inbound(_event):
+        return None
+
+    def stamp_then_replace_callback(event):
+        stamp(event)
+        monkeypatch.setattr(transport, "_inbound", replacement_inbound)
+
+    monkeypatch.setattr(
+        adapter,
+        "_stamp_slack_session_thread",
+        stamp_then_replace_callback,
+    )
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    register.assert_not_called()
+    assert not registry.verifies(event.source, epoch=epoch)
+    assert runner._is_user_authorized(event.source) is False
+
+
+@pytest.mark.asyncio
+async def test_transport_replacement_during_normalization_prevents_reseal_and_denies(
+    monkeypatch,
+):
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+    foreign_transport, _foreign_adapter, _foreign_runner = _authenticated_stack(
+        "authenticated-foreign"
+    )
+    registry = transport._source_provenance
+    foreign_registry = foreign_transport._source_provenance
+    epoch = transport.authenticated_connection_epoch
+    foreign_epoch = foreign_transport.authenticated_connection_epoch
+
+    assert adapter._transport is transport
+    assert getattr(transport._inbound, "__self__", None) is adapter
+    assert getattr(transport._inbound, "__func__", None) is adapter._on_inbound.__func__
+    assert registry.verifies(event.source, epoch=epoch)
+    assert runner._is_user_authorized(event.source) is True
+
+    register = MagicMock(wraps=registry.register)
+    foreign_register = MagicMock(wraps=foreign_registry.register)
+    monkeypatch.setattr(registry, "register", register)
+    monkeypatch.setattr(foreign_registry, "register", foreign_register)
+    stamp = adapter._stamp_slack_session_thread
+
+    def stamp_then_replace_transport(event):
+        stamp(event)
+        monkeypatch.setattr(adapter, "_transport", foreign_transport)
+
+    monkeypatch.setattr(
+        adapter,
+        "_stamp_slack_session_thread",
+        stamp_then_replace_transport,
+    )
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is False
+    assert event.source.thread_id == "1700.0100"
+    register.assert_not_called()
+    foreign_register.assert_not_called()
+    assert not registry.verifies(event.source, epoch=epoch)
+    assert not foreign_registry.verifies(event.source, epoch=foreign_epoch)
+    assert runner._is_user_authorized(event.source) is False
+
+
+@pytest.mark.asyncio
+async def test_registered_real_thread_stays_verified_without_reseal(monkeypatch):
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(
+        transport,
+        message_id="1700.0300",
+        thread_id="1700.0100",
+    )
+    registry = transport._source_provenance
+    epoch = transport.authenticated_connection_epoch
+
+    assert getattr(transport._inbound, "__self__", None) is adapter
+    assert getattr(transport._inbound, "__func__", None) is adapter._on_inbound.__func__
+    assert registry.verifies(event.source, epoch=epoch)
+    assert runner._is_user_authorized(event.source) is True
+
+    register = MagicMock(wraps=registry.register)
+    monkeypatch.setattr(registry, "register", register)
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is True
+    assert event.source.thread_id == "1700.0100"
+    register.assert_not_called()
+    assert registry.verifies(event.source, epoch=epoch)
+    assert runner._is_user_authorized(event.source) is True
+
+
+@pytest.mark.asyncio
+async def test_later_mutation_revokes_resealed_source_again():
+    transport, adapter, runner = _authenticated_stack()
+    event = _wire_top_level_dm(transport)
+
+    assert await _authorize_through_relay_ingress(adapter, runner, event) is True
+    assert transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
+
+    event.source.user_id = "later-forged-user"
+
+    assert runner._is_user_authorized(event.source) is False
+    assert not transport._source_provenance.verifies(
+        event.source,
+        epoch=transport.authenticated_connection_epoch,
+    )
 
 
 def test_two_top_level_messages_key_distinct_sessions():

@@ -1,6 +1,7 @@
 """Tests for the /voice command and auto voice reply in the gateway."""
 
 import asyncio
+import copy
 import importlib.util
 import json
 import os
@@ -83,6 +84,17 @@ def _make_runner(tmp_path):
     runner.session_store = MagicMock()
     runner._is_user_authorized = lambda source: True
     return runner
+
+
+def _install_mock_discord_source_builder(adapter):
+    """Give legacy mock-adapter tests a synchronous SessionSource builder."""
+    from gateway.config import Platform
+
+    def build_source(**kwargs):
+        profile = kwargs.pop("_profile_override", None)
+        return SessionSource(platform=Platform.DISCORD, profile=profile, **kwargs)
+
+    adapter.build_source = MagicMock(side_effect=build_source)
 
 
 # =====================================================================
@@ -345,7 +357,8 @@ class TestSendVoiceReply:
         mock_adapter.send_voice.assert_called_once()
         call_kwargs = mock_adapter.send_voice.call_args.kwargs
         assert call_kwargs["reply_to"] == "462"
-        assert call_kwargs["metadata"] == {
+        metadata = call_kwargs["metadata"]
+        expected_thread_metadata = {
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,
             "direct_messages_topic_id": "20197",
@@ -354,6 +367,9 @@ class TestSendVoiceReply:
             # mirrors the final-text path in gateway/platforms/base.py.
             "notify": True,
         }
+        assert expected_thread_metadata.items() <= metadata.items()
+        assert event._response_generation
+        assert metadata["_response_generation"] == event._response_generation
 
 
 # =====================================================================
@@ -622,6 +638,7 @@ class TestVoiceChannelCommands:
         mock_adapter._client = MagicMock()
         mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
         mock_adapter.handle_message = AsyncMock()
+        _install_mock_discord_source_builder(mock_adapter)
         runner.adapters[Platform.DISCORD] = mock_adapter
         await runner._handle_voice_channel_input(111, 42, "Hello from VC")
         mock_adapter.handle_message.assert_called_once()
@@ -642,6 +659,7 @@ class TestVoiceChannelCommands:
         mock_adapter._client.get_channel = MagicMock(return_value=AsyncMock())
         mock_adapter.handle_message = AsyncMock()
         mock_adapter._resolve_channel_prompt = MagicMock(return_value="Be terse in #dev.")
+        _install_mock_discord_source_builder(mock_adapter)
         runner.adapters[Platform.DISCORD] = mock_adapter
         await runner._handle_voice_channel_input(111, 42, "Hello from VC")
         mock_adapter._resolve_channel_prompt.assert_called_once_with("123")
@@ -670,6 +688,7 @@ class TestVoiceChannelCommands:
         mock_adapter._client = MagicMock()
         mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
         mock_adapter.handle_message = AsyncMock()
+        _install_mock_discord_source_builder(mock_adapter)
         runner.adapters[Platform.DISCORD] = mock_adapter
 
         await runner._handle_voice_channel_input(111, 42, "Hello from VC")
@@ -680,6 +699,268 @@ class TestVoiceChannelCommands:
         assert event.source.chat_type == "group"
         assert event.source.chat_name == "Hermes Server / #general"
         assert event.source.user_id == "42"
+
+
+class TestVoiceChannelInputAuthorization:
+    """Exercise the real voice callback through native Discord authorization."""
+
+    @pytest.fixture
+    def runner(self, tmp_path):
+        return _make_runner(tmp_path)
+
+    @staticmethod
+    def _make_runner(
+        *,
+        source_data=None,
+        allowed_users=(),
+        allowed_roles=(),
+        allowed_channels="",
+        ignored_channels="",
+        paired_users=(),
+        member_roles=None,
+    ):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+        from plugins.platforms.discord.adapter import DiscordAdapter, _GATE_ENV_KEYS
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        runner._profile_adapters = {}
+        runner._profile_name_for_source = lambda _source: None
+        runner._recent_voice_transcripts = {}
+        runner.pairing_stores = {}
+        runner.pairing_store = MagicMock()
+        paired = {str(user_id) for user_id in paired_users}
+        runner.pairing_store.is_approved.side_effect = (
+            lambda platform, user_id: platform == "discord" and str(user_id) in paired
+        )
+
+        extra = {}
+        if allowed_channels:
+            extra["allowed_channels"] = allowed_channels
+        if ignored_channels:
+            extra["ignored_channels"] = ignored_channels
+        adapter = object.__new__(DiscordAdapter)
+        adapter.platform = Platform.DISCORD
+        adapter.config = PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra=extra,
+        )
+        adapter.gateway_runner = runner
+        adapter._gate_env_snapshot = {key: "" for key in _GATE_ENV_KEYS}
+        adapter._allowed_user_ids = {str(user_id) for user_id in allowed_users}
+        adapter._allowed_role_ids = {int(role_id) for role_id in allowed_roles}
+        adapter._is_pairing_approved_user = (
+            lambda user_id: str(user_id) in paired
+        )
+        adapter._voice_text_channels = {111: 123}
+        adapter._voice_sources = {111: source_data} if source_data is not None else {}
+        adapter._resolve_channel_prompt = lambda _chat_id: None
+        adapter.handle_message = AsyncMock()
+
+        role_map = member_roles or {}
+
+        def get_member(user_id):
+            roles = role_map.get(str(user_id))
+            if roles is None:
+                return None
+            return SimpleNamespace(
+                id=int(user_id),
+                display_name=f"Speaker {user_id}",
+                name=f"speaker-{user_id}",
+                roles=[SimpleNamespace(id=int(role_id)) for role_id in roles],
+            )
+
+        guild = SimpleNamespace(id=111, get_member=get_member)
+        channel = AsyncMock()
+        adapter._client = MagicMock()
+        adapter._client.get_guild = MagicMock(return_value=guild)
+        adapter._client.get_channel = MagicMock(return_value=channel)
+        runner.adapters = {Platform.DISCORD: adapter}
+        return runner, adapter
+
+    @pytest.mark.asyncio
+    async def test_linked_source_preserves_session_route_and_allows_user(self):
+        from gateway.config import Platform
+
+        linked = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="123",
+            chat_name="Hermes Guild / #voice-text",
+            chat_type="thread",
+            user_id="joiner",
+            user_name="Joiner",
+            thread_id="124",
+            chat_topic="Voice support",
+            scope_id="111",
+            parent_chat_id="123",
+            message_id="join-message",
+            profile=None,
+        ).to_dict()
+        runner, adapter = self._make_runner(
+            source_data=linked,
+            allowed_users={"42"},
+            member_roles={"42": set()},
+        )
+
+        await runner._handle_voice_channel_input(111, 42, "linked route")
+
+        adapter.handle_message.assert_awaited_once()
+        source = adapter.handle_message.call_args.args[0].source
+        assert runner._is_user_authorized(source) is True
+        assert source.user_id == "42"
+        assert source.user_name == "Speaker 42"
+        assert source.chat_id == "123"
+        assert source.chat_name == "Hermes Guild / #voice-text"
+        assert source.chat_type == "thread"
+        assert source.thread_id == "124"
+        assert source.chat_topic == "Voice support"
+        assert source.scope_id == source.guild_id == "111"
+        assert source.parent_chat_id == "123"
+        assert source.message_id == "join-message"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("policy", ["allowlist", "channel", "role", "pairing"])
+    async def test_fallback_source_allows_each_configured_policy(self, policy):
+        kwargs = {}
+        if policy == "allowlist":
+            kwargs["allowed_users"] = {"42"}
+        elif policy == "channel":
+            kwargs["allowed_channels"] = "123"
+        elif policy == "role":
+            kwargs["allowed_roles"] = {7}
+            kwargs["member_roles"] = {"42": {7}}
+        else:
+            kwargs["paired_users"] = {"42"}
+        runner, adapter = self._make_runner(**kwargs)
+
+        await runner._handle_voice_channel_input(111, 42, f"fallback {policy}")
+
+        adapter.handle_message.assert_awaited_once()
+        source = adapter.handle_message.call_args.args[0].source
+        assert runner._is_user_authorized(source) is True
+        assert source.chat_id == "123"
+        assert source.chat_type == "channel"
+        assert source.scope_id == source.guild_id == "111"
+        assert source.user_id == "42"
+
+    @pytest.mark.asyncio
+    async def test_ignored_channel_denial_precedes_user_allowlist(self):
+        runner, adapter = self._make_runner(
+            allowed_users={"42"},
+            ignored_channels="123",
+        )
+
+        await runner._handle_voice_channel_input(111, 42, "ignored channel")
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_channel_only_does_not_bypass_configured_role(self):
+        runner, adapter = self._make_runner(
+            allowed_roles={7},
+            allowed_channels="123",
+            member_roles={"42": {7}, "43": set()},
+        )
+
+        await runner._handle_voice_channel_input(111, 42, "role holder")
+        await runner._handle_voice_channel_input(111, 43, "not role holder")
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.call_args.args[0].source.user_id == "42"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_source",
+        [
+            {"platform": "discord", "chat_id": "123", "chat_type": "channel", "scope_id": "111", "guild_id": []},
+            {"platform": "discord", "chat_id": "123", "chat_type": "channel", "scope_id": "111", "guild_id": "222"},
+            {"platform": "telegram", "chat_id": "123", "chat_type": "channel"},
+        ],
+        ids=("malformed-guild-alias", "conflicting-guild-alias", "wrong-platform"),
+    )
+    async def test_malformed_linked_source_fails_closed_without_crashing(self, bad_source):
+        runner, adapter = self._make_runner(
+            source_data=bad_source,
+            allowed_users={"42"},
+        )
+
+        await runner._handle_voice_channel_input(111, 42, "malformed source")
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_joined_secondary_profile_uses_owning_registered_adapter(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+
+        runner, primary = self._make_runner()
+        _unused_runner, secondary = self._make_runner(allowed_users={"42"})
+        secondary.gateway_runner = runner
+        runner._profile_adapters = {"secondary": {Platform.DISCORD: secondary}}
+        runner._voice_mode = {}
+        runner._save_voice_modes = lambda: None
+        runner._set_adapter_auto_tts_enabled = lambda *_args, **_kwargs: None
+
+        secondary._voice_input_callback = None
+        secondary._on_voice_disconnect = None
+        secondary._voice_mode_getter = None
+        secondary._voice_text_channels = {}
+        secondary._voice_sources = {}
+        secondary.get_user_voice_channel = AsyncMock(
+            return_value=SimpleNamespace(name="Secondary Voice")
+        )
+        secondary.join_voice_channel = AsyncMock(return_value=True)
+
+        join_source = secondary.build_source(
+            chat_id="123",
+            chat_type="channel",
+            user_id="42",
+            scope_id="111",
+            _profile_override="secondary",
+        )
+        event = MessageEvent(
+            text="/voice join",
+            message_type=MessageType.TEXT,
+            source=join_source,
+            raw_message=SimpleNamespace(guild_id=111),
+        )
+
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            result = await runner._handle_voice_channel_join(event)
+            assert "Joined voice channel" in result
+            await secondary._voice_input_callback(
+                guild_id=111,
+                user_id=42,
+                transcript="secondary profile voice",
+            )
+
+        primary.handle_message.assert_not_awaited()
+        secondary.handle_message.assert_awaited_once()
+        source = secondary.handle_message.call_args.args[0].source
+        assert source.profile == "secondary"
+        assert runner._registered_transport_adapter(source) is secondary
+        with patch("hermes_cli.profiles.profile_exists", return_value=True):
+            assert runner._is_user_authorized(source) is True
+
+    def test_registered_voice_source_cannot_be_forged_copied_or_mutated(self):
+        runner, adapter = self._make_runner(allowed_users={"42"})
+        source = adapter.build_source(
+            chat_id="123",
+            chat_type="channel",
+            user_id="42",
+            user_name="Speaker 42",
+            scope_id="111",
+        )
+        assert runner._is_user_authorized(source) is True
+
+        forged = SessionSource.from_dict(source.to_dict())
+        assert runner._is_user_authorized(forged) is False
+        assert runner._is_user_authorized(copy.copy(source)) is False
+
+        source.user_name = "mutated"
+        assert runner._is_user_authorized(source) is False
 
 
     # -- _get_guild_id --

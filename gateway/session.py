@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional, cast
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,31 @@ def _is_session_key_unsafe(value: object) -> bool:
     return len(s) >= 2 and s[0].isalpha() and s[1] == ":"
 
 
+def _validated_scope_aliases(data: Dict[str, Any]) -> Optional[str]:
+    """Validate canonical/deprecated scope aliases and return one scope value.
+
+    ``guild_id`` is supported only as a backward-compatible fallback when
+    ``scope_id`` is absent or ``None``. When both aliases carry values, each is
+    validated independently and they must agree exactly.
+    """
+    values: Dict[str, Optional[str]] = {}
+    for key in ("scope_id", "guild_id"):
+        value = data.get(key)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip()
+        ):
+            raise ValueError(
+                f"SessionSource field {key!r} must be a nonempty string or None"
+            )
+        values[key] = value
+
+    scope_id = values["scope_id"]
+    guild_id = values["guild_id"]
+    if scope_id is not None and guild_id is not None and scope_id != guild_id:
+        raise ValueError("SessionSource scope_id and guild_id must match")
+    return scope_id if scope_id is not None else guild_id
+
+
 @dataclass
 class SessionSource:
     """
@@ -183,6 +208,12 @@ class SessionSource:
     # namespacing and the per-turn config/credential scope.
     profile: Optional[str] = None
 
+    # Durable, non-authoritative route discriminator. ``relay`` means the
+    # process-level RelayAdapter should be considered for resumed delivery;
+    # authorization still requires current adapter identity, live auth epoch,
+    # exact profile, underlying platform, and current platform policy.
+    transport_route: Optional[str] = None
+
     # Discord auto-thread metadata.  Newly auto-created Discord threads start
     # with a fast placeholder title from the raw message, then the gateway can
     # rename them after the first agent turn using the generated session title.
@@ -203,17 +234,12 @@ class SessionSource:
     # session and only the first auto-thread ever gets an auto-title/rename.
     prospective_thread_id: Optional[str] = None
 
-    # Internal, wire-INVISIBLE trust signal: True when this event was delivered
-    # to the gateway over the per-instance-authenticated relay WebSocket (the
-    # Team Gateway connector). The connector authenticates the gateway's socket
-    # with a per-instance secret and resolves owner-only author bindings BEFORE
-    # delivering, so a relay-delivered event is already authorized as this
-    # instance's bound user. ``platform`` carries the UNDERLYING platform
-    # (e.g. ``discord``) for session-keying/egress, NOT ``relay`` — so authz
-    # must key the upstream-trust decision off THIS flag, not off ``platform``.
-    # Set locally by the relay transport (``ws_transport._event_from_wire``);
-    # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
-    # forge it across the wire or have it restored from persistence.
+    # Internal, wire-INVISIBLE routing marker: True when an event was rebuilt by
+    # the relay WebSocket lane. This flag alone is NOT authorization provenance:
+    # callers can construct it. The authenticated boundary separately attaches
+    # the exact live transport object, and authz verifies that identity against
+    # the registered RelayAdapter. Excluded from persistence so restored events
+    # cannot accidentally route as live relay deliveries.
     delivered_via_upstream_relay: bool = False
 
     def __post_init__(self) -> None:
@@ -276,6 +302,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if self.transport_route == "relay":
+            d["transport_route"] = "relay"
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -286,11 +314,68 @@ class SessionSource:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
-        return cls(
-            platform=Platform(data["platform"]),
-            chat_id=str(data["chat_id"]),
+        # Persistence is an authorization boundary. Validate the raw values
+        # before applying compatibility defaults or normalization so malformed
+        # identifiers cannot acquire trust merely by being stringified.
+        raw_platform = data.get("platform")
+        if not isinstance(raw_platform, str):
+            raise ValueError("persisted source platform must be a string")
+        platform = Platform(raw_platform)
+        raw_chat_id = data.get("chat_id")
+        raw_chat_type = data.get("chat_type")
+        raw_profile = data.get("profile")
+        raw_route = data.get("transport_route")
+        raw_scope = _validated_scope_aliases(data)
+        optional_strings = (
+            data.get("chat_name"),
+            data.get("user_id"),
+            data.get("user_name"),
+            data.get("thread_id"),
+            data.get("chat_topic"),
+            data.get("user_id_alt"),
+            data.get("chat_id_alt"),
+            raw_scope,
+            data.get("parent_chat_id"),
+            data.get("message_id"),
+            raw_profile,
+            data.get("auto_thread_initial_name"),
+            data.get("prospective_thread_id"),
+        )
+        discord_chat_types = {"dm", "group", "channel", "thread", "forum"}
+        chat_type_present = "chat_type" in data
+        persisted_metadata_valid = (
+            isinstance(raw_chat_id, str)
+            and bool(raw_chat_id.strip())
+            and raw_route in (None, "relay")
+            and all(value is None or isinstance(value, str) for value in optional_strings)
+            and not (isinstance(raw_profile, str) and not raw_profile.strip())
+            and (
+                not chat_type_present
+                or (
+                    isinstance(raw_chat_type, str)
+                    and bool(raw_chat_type.strip())
+                )
+            )
+            and (
+                platform != Platform.DISCORD
+                or (
+                    chat_type_present
+                    and raw_chat_type in discord_chat_types
+                )
+            )
+            and (
+                "auto_thread_created" not in data
+                or isinstance(data.get("auto_thread_created"), bool)
+            )
+        )
+        if not persisted_metadata_valid:
+            raise ValueError("malformed persisted session source metadata")
+
+        source = cls(
+            platform=platform,
+            chat_id=cast(str, raw_chat_id),
             chat_name=data.get("chat_name"),
-            chat_type=data.get("chat_type", "dm"),
+            chat_type=raw_chat_type if isinstance(raw_chat_type, str) else "dm",
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
@@ -299,14 +384,21 @@ class SessionSource:
             chat_id_alt=data.get("chat_id_alt"),
             # D-Q2.5 dual-read: prefer the canonical `scope_id`, fall back to the
             # deprecated `guild_id` alias (a peer not yet migrated still sends it).
-            scope_id=data.get("scope_id", data.get("guild_id")),
+            scope_id=raw_scope,
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
-            profile=data.get("profile"),
-            auto_thread_created=bool(data.get("auto_thread_created", False)),
+            profile=raw_profile,
+            transport_route="relay" if raw_route == "relay" else None,
+            auto_thread_created=(
+                data.get("auto_thread_created", False)
+                if isinstance(data.get("auto_thread_created", False), bool)
+                else False
+            ),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
         )
+        setattr(source, "_persisted_metadata_valid", persisted_metadata_valid)
+        return source
     
 
 

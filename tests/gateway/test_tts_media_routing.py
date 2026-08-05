@@ -75,11 +75,14 @@ async def test_base_adapter_routes_voice_tagged_telegram_ogg_media_tag_to_voice_
 
     await adapter._process_message_background(event, build_session_key(event.source))
 
-    adapter.send_voice.assert_awaited_once_with(
-        chat_id="chat-1",
-        audio_path=str(media_file),
-        metadata={"notify": True},
-    )
+    adapter.send_voice.assert_awaited_once()
+    send_kwargs = adapter.send_voice.await_args.kwargs
+    assert send_kwargs["chat_id"] == "chat-1"
+    assert send_kwargs["audio_path"] == str(media_file)
+    metadata = send_kwargs["metadata"]
+    assert metadata["notify"] is True
+    assert metadata["_response_generation"]
+    assert metadata["_response_generation"] == event._response_generation
     adapter.send_document.assert_not_awaited()
 
 

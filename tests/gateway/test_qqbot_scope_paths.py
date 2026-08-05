@@ -32,7 +32,13 @@ from gateway.session import SessionSource
 
 
 @pytest.fixture(autouse=True)
-def _reset_scope_state(monkeypatch):
+def _reset_scope_state(monkeypatch, _hermetic_environment):
+    from hermes_cli.profiles import get_profile_dir
+
+    # Authorization now fails closed for named profiles that do not exist.
+    # These scope-path tests use "coder" as a fictional secondary profile, so
+    # create it inside the per-test HERMES_HOME before exercising later gates.
+    get_profile_dir("coder").mkdir(parents=True, exist_ok=True)
     for key in (
         "QQ_ALLOW_ALL_USERS",
         "QQ_ALLOWED_USERS",
