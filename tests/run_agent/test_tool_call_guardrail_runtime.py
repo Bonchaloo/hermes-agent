@@ -191,8 +191,10 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     _seed_exact_failures(agent, "web_search", blocked_args)
     starts = []
     progress_events = []
+    completed_results = []
     agent.tool_start_callback = lambda tool_call_id, name, args: starts.append((tool_call_id, name, args))
     agent.tool_progress_callback = lambda event, name, preview, args, **kw: progress_events.append((event, name, args, kw))
+    agent.tool_complete_callback = lambda tool_call_id, name, args, result: completed_results.append((tool_call_id, name, args, result))
     calls = [
         _mock_tool_call("web_search", json.dumps(blocked_args), "c-block"),
         _mock_tool_call("web_search", json.dumps(allowed_args), "c-allow"),
@@ -211,13 +213,22 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert executed == [("web_search", allowed_args, "c-allow")]
     assert [m["tool_call_id"] for m in messages] == ["c-block", "c-allow"]
     assert "repeated_exact_failure_block" in messages[0]["content"]
-    assert json.loads(messages[1]["content"]) == {"ok": "allowed"}
+    # Model-facing web results are framed as untrusted text even when the
+    # tool's JSON is short; machine callbacks still receive the raw result.
+    allowed_content = messages[1]["content"]
+    assert allowed_content.startswith('<untrusted_tool_result source="web_search">')
+    assert allowed_content.endswith("</untrusted_tool_result>")
+    assert '\n{"ok": "allowed"}\n' in allowed_content
     assert starts == [("c-allow", "web_search", allowed_args)]
     started_events = [event for event in progress_events if event[0] == "tool.started"]
     completed_events = [event for event in progress_events if event[0] == "tool.completed"]
     assert started_events == [("tool.started", "web_search", allowed_args, {})]
     assert len(completed_events) == 1
     assert completed_events[0][1] == "web_search"
+    assert completed_events[0][3]["result"] == json.dumps({"ok": "allowed"})
+    assert completed_results == [
+        ("c-allow", "web_search", allowed_args, json.dumps({"ok": "allowed"}))
+    ]
 
 
 def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
