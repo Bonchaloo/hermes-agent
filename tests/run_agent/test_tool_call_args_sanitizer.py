@@ -127,9 +127,11 @@ def test_multiple_corrupted_tool_calls_in_one_message():
     assert messages[0]["tool_calls"][1]["function"]["arguments"] == '{"path":"/tmp/bar"}'
     assert messages[0]["tool_calls"][2]["function"]["arguments"] == "{}"
     assert messages[1]["tool_call_id"] == "call_1"
-    assert messages[1]["content"] == marker
     assert messages[2]["tool_call_id"] == "call_3"
-    assert messages[2]["content"] == marker
+    for result in messages[1:3]:
+        assert result["content"].startswith('<untrusted_tool_result source="read_file">')
+        assert marker in result["content"]
+        assert result["content"].endswith("</untrusted_tool_result>")
 
 
 def test_empty_string_arguments_treated_as_empty_object(caplog):
