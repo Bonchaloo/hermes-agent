@@ -9263,7 +9263,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         already run and images are represented in-text.
         """
         history = history or []
-        message_text = event.text or ""
+        sender_text = event.text or ""
+        message_text = sender_text
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Use the same helper every other call site uses so the write key here
@@ -9474,11 +9475,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = _build_document_context_note(display_name, agent_path, mtype)
                 message_text = f"{context_note}\n\n{message_text}"
 
-        # Expand @ references only from the current user's text and attachment
-        # notes. Reply quotes and channel-history backfill can contain text
-        # written by other senders; processing them here would let those
-        # senders trigger @file/@url expansion inside the user's turn.
-        if "@" in message_text:
+        # Only the sender's original text can request @ references. Sender
+        # names, attachment names, vision descriptions, transcripts, reply
+        # quotes, and channel history can all contain externally supplied text.
+        if "@" in sender_text:
             try:
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length
@@ -9502,7 +9502,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     config_context_length=_msg_config_ctx,
                 )
                 _ctx_result = await preprocess_context_references_async(
-                    message_text,
+                    sender_text,
                     cwd=_msg_cwd,
                     context_length=_msg_ctx_len,
                     allowed_root=_msg_cwd,
@@ -9516,7 +9516,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     return None
                 if _ctx_result.expanded:
-                    message_text = _ctx_result.message
+                    # Enrichment helpers prepend context and preserve the
+                    # original sender text as a suffix. If that contract
+                    # changes, skip expansion rather than promote context.
+                    if message_text.endswith(sender_text):
+                        message_text = message_text[:-len(sender_text)] + _ctx_result.message
+                    else:
+                        logger.warning("Skipping @ expansion: sender text is no longer a suffix")
             except Exception as exc:
                 logger.debug("@ context reference expansion failed: %s", exc)
 
@@ -9524,7 +9530,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cannot activate context references. Keep the sender prefix attached
         # only to the trigger message, and keep the reply pointer outermost.
         if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
+            from gateway.reply_context import format_channel_context
+
+            message_text = format_channel_context(event.channel_context) + message_text
 
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Keep the reply pointer even when its text is already in history:

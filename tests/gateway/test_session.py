@@ -527,13 +527,13 @@ class TestSenderPrefixWithBackfill:
         result = await runner._prepare_inbound_message_text(
             event=event, source=source, history=[],
         )
-        assert result.startswith("[Recent channel messages]")
+        assert result.startswith('[Channel history: "[Recent channel messages]')
         assert "[Alice] [Recent channel messages]" not in result
         assert "[New message]\n[Alice] hello world" in result
 
     @pytest.mark.asyncio
     async def test_backfill_preserves_context_block(self, runner, source):
-        """The backfill block should pass through unchanged — no double-prefixing."""
+        """The backfill block stays intact inside its quoted context."""
         context = "[Recent channel messages]\n[Bob] first\n[Charlie [bot]] second"
         event = MessageEvent(
             text="hey everyone", source=source, channel_context=context,
@@ -541,7 +541,8 @@ class TestSenderPrefixWithBackfill:
         result = await runner._prepare_inbound_message_text(
             event=event, source=source, history=[],
         )
-        assert result.startswith(context)
+        first_line = result.splitlines()[0]
+        assert json.loads(first_line.removeprefix("[Channel history: ").removesuffix("]")) == context
         assert "[Alice] hey everyone" in result
         assert "[Alice] [Bob]" not in result
         assert "[Alice] [Charlie" not in result
