@@ -2826,7 +2826,10 @@ class TestConcurrentToolExecution:
         assert starts == []
         assert len(messages) == 1
         assert messages[0]["role"] == "tool"
-        assert json.loads(messages[0]["content"]) == {"error": "Blocked by policy"}
+        framed = messages[0]["content"]
+        assert framed.startswith('<untrusted_tool_result source="write_file">')
+        body = framed.split("\n\n", 1)[1].removesuffix("\n</untrusted_tool_result>")
+        assert json.loads(body) == {"error": "Blocked by policy"}
 
     def test_sequential_blocked_tool_emits_terminal_post_tool_hook(self, agent, monkeypatch):
         """Blocked pre_tool_call decisions still terminate observer tool spans."""
