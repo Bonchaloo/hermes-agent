@@ -9263,7 +9263,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         already run and images are represented in-text.
         """
         history = history or []
-        message_text = event.text or ""
+        sender_text = event.text or ""
+        message_text = sender_text
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Use the same helper every other call site uses so the write key here
@@ -9281,12 +9282,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
-
-        # Prepend channel context from history backfill (if any).  This
-        # happens after sender-prefix so the prefix only applies to the
-        # trigger message, not the backfill block.
-        if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
         # Declare at outer scope so the audio-file-paths handling block below
         # remains safe when ``event.media_urls`` is empty (no inner block runs).
@@ -9480,23 +9475,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = _build_document_context_note(display_name, agent_path, mtype)
                 message_text = f"{context_note}\n\n{message_text}"
 
-        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
-            # Always inject the reply-to pointer — even when the quoted text
-            # already appears in history. The prefix isn't deduplication, it's
-            # disambiguation: it tells the agent *which* prior message the user
-            # is referencing. History can contain the same or similar text
-            # multiple times, and without an explicit pointer the agent has to
-            # guess (or answer for both subjects). Token overhead is minimal.
-            reply_snippet = event.reply_to_text[:500]
-            if getattr(event, "reply_to_is_own_message", False):
-                message_text = (
-                    f'[Replying to your previous message: "{reply_snippet}"]\n\n'
-                    f"{message_text}"
-                )
-            else:
-                message_text = f'[Replying to: "{reply_snippet}"]\n\n{message_text}'
-
-        if "@" in message_text:
+        # Only the sender's original text can request @ references. Sender
+        # names, attachment names, vision descriptions, transcripts, reply
+        # quotes, and channel history can all contain externally supplied text.
+        if "@" in sender_text:
             try:
                 from agent.context_references import preprocess_context_references_async
                 from agent.model_metadata import get_model_context_length
@@ -9520,7 +9502,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     config_context_length=_msg_config_ctx,
                 )
                 _ctx_result = await preprocess_context_references_async(
-                    message_text,
+                    sender_text,
                     cwd=_msg_cwd,
                     context_length=_msg_ctx_len,
                     allowed_root=_msg_cwd,
@@ -9534,9 +9516,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     return None
                 if _ctx_result.expanded:
-                    message_text = _ctx_result.message
+                    # Enrichment helpers prepend context and preserve the
+                    # original sender text as a suffix. If that contract
+                    # changes, skip expansion rather than promote context.
+                    if message_text.endswith(sender_text):
+                        message_text = message_text[:-len(sender_text)] + _ctx_result.message
+                    else:
+                        logger.warning("Skipping @ expansion: sender text is no longer a suffix")
             except Exception as exc:
                 logger.debug("@ context reference expansion failed: %s", exc)
+
+        # Add channel history after @ expansion so quoted third-party messages
+        # cannot activate context references. Keep the sender prefix attached
+        # only to the trigger message, and keep the reply pointer outermost.
+        if getattr(event, "channel_context", None):
+            from gateway.reply_context import format_channel_context
+
+            message_text = format_channel_context(event.channel_context) + message_text
+
+        if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
+            # Keep the reply pointer even when its text is already in history:
+            # it identifies which prior message the user is referencing.
+            from gateway.reply_context import format_reply_context
+
+            message_text = format_reply_context(
+                event.reply_to_text,
+                own_message=getattr(event, "reply_to_is_own_message", False),
+            ) + message_text
 
         return message_text
 
